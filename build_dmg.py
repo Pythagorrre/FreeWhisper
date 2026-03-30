@@ -24,7 +24,7 @@ APP_ICON_POSITION = (230, 280)
 APPLICATIONS_ICON_POSITION = (760, 280)
 ICON_SIZE = 160
 RETINA_SCALE = 2
-CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "dmg-background-clean.png"
+CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "image1.png"
 BUNDLE_CANDIDATES = (
     BUNDLE_PATH,
     Path("/Applications") / f"{APP_NAME}.app",
@@ -68,16 +68,30 @@ def default_background_image() -> Image.Image:
 
     arrow_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     arrow_draw = ImageDraw.Draw(arrow_layer)
+    arrow_center_x = ((APP_ICON_POSITION[0] + APPLICATIONS_ICON_POSITION[0]) // 2) * RETINA_SCALE
+    arrow_center_y = APP_ICON_POSITION[1] * RETINA_SCALE
+    body_left = arrow_center_x - 210
+    body_top = arrow_center_y - 54
+    body_right = arrow_center_x + 40
+    body_bottom = arrow_center_y + 54
+    head_base_x = arrow_center_x - 12
+    head_tip_x = arrow_center_x + 240
+    head_half_height = 132
+
     arrow_draw.rounded_rectangle(
-        (312, 228, 592, 328),
-        radius=46,
-        fill=(222, 228, 236, 255),
+        (body_left, body_top, body_right, body_bottom),
+        radius=48,
+        fill=(226, 232, 240, 242),
     )
     arrow_draw.polygon(
-        ((540, 170), (750, 280), (540, 390)),
-        fill=(222, 228, 236, 255),
+        (
+            (head_base_x, arrow_center_y - head_half_height),
+            (head_tip_x, arrow_center_y),
+            (head_base_x, arrow_center_y + head_half_height),
+        ),
+        fill=(226, 232, 240, 242),
     )
-    arrow_layer = arrow_layer.filter(ImageFilter.GaussianBlur(0.4))
+    arrow_layer = arrow_layer.filter(ImageFilter.GaussianBlur(1.2))
     image.alpha_composite(arrow_layer)
 
     cloud_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -96,38 +110,6 @@ def default_background_image() -> Image.Image:
     return image
 
 
-def soften_live_drop_targets(image: Image.Image) -> Image.Image:
-    scale_x = image.width / WINDOW_WIDTH
-    scale_y = image.height / WINDOW_HEIGHT
-
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    def center_box(center: tuple[int, int], width: int, height: int) -> tuple[int, int, int, int]:
-        cx = int(center[0] * scale_x)
-        cy = int(center[1] * scale_y)
-        half_w = int(width * scale_x / 2)
-        half_h = int(height * scale_y / 2)
-        return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
-
-    # Remove the baked text from the artwork so Finder can render the live labels
-    # cleanly, while keeping the arrow and decorative atmosphere.
-    draw.rounded_rectangle(
-        center_box((APP_ICON_POSITION[0], APP_ICON_POSITION[1] + 152), 320, 72),
-        radius=int(26 * scale_x),
-        fill=(248, 250, 253, 246),
-    )
-    draw.rounded_rectangle(
-        center_box((APPLICATIONS_ICON_POSITION[0], APPLICATIONS_ICON_POSITION[1] + 152), 300, 72),
-        radius=int(26 * scale_x),
-        fill=(248, 250, 253, 246),
-    )
-
-    overlay = overlay.filter(ImageFilter.GaussianBlur(int(14 * scale_x)))
-    image.alpha_composite(overlay)
-    return image
-
-
 def create_background_image(path: Path) -> None:
     if CUSTOM_BACKGROUND_SOURCE.exists():
         image = Image.open(CUSTOM_BACKGROUND_SOURCE).convert("RGBA")
@@ -137,7 +119,6 @@ def create_background_image(path: Path) -> None:
             method=Image.LANCZOS,
             centering=(0.5, 0.5),
         )
-        image = soften_live_drop_targets(image)
     else:
         image = default_background_image()
 
