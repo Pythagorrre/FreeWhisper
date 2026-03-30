@@ -16,15 +16,16 @@ from build_standalone_app import APP_NAME, BUNDLE_PATH, build_bundle
 ROOT = Path(__file__).resolve().parent
 DMG_PATH = ROOT / f"{APP_NAME}.dmg"
 VOLUME_NAME = APP_NAME
-BACKGROUND_DIR_NAME = ".background"
+BACKGROUND_DIR_NAME = "ㅤ"
 BACKGROUND_FILE_NAME = "background.png"
-WINDOW_BOUNDS = (120, 120, 1120, 700)
+WINDOW_BOUNDS = (120, 120, 860, 520)
 WINDOW_WIDTH = WINDOW_BOUNDS[2] - WINDOW_BOUNDS[0]
 WINDOW_HEIGHT = WINDOW_BOUNDS[3] - WINDOW_BOUNDS[1]
-APP_ICON_POSITION = (230, 280)
-APPLICATIONS_ICON_POSITION = (760, 280)
-ICON_SIZE = 160
+APP_ICON_POSITION = (155, 190)
+APPLICATIONS_ICON_POSITION = (505, 190)
+ICON_SIZE = 128
 RETINA_SCALE = 2
+BACKGROUND_CENTERING = (0.33, 0.38)
 CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "image1.png"
 BUNDLE_CANDIDATES = (
     BUNDLE_PATH,
@@ -54,7 +55,7 @@ def ensure_app_bundle() -> Path:
 
 
 def default_background_image() -> Image.Image:
-    width, height = WINDOW_WIDTH * RETINA_SCALE, WINDOW_HEIGHT * RETINA_SCALE
+    width, height = WINDOW_WIDTH, WINDOW_HEIGHT
     image = Image.new("RGBA", (width, height), "#f4f7fb")
     draw = ImageDraw.Draw(image)
 
@@ -116,9 +117,9 @@ def create_background_image(path: Path) -> None:
         image = Image.open(CUSTOM_BACKGROUND_SOURCE).convert("RGBA")
         image = ImageOps.fit(
             image,
-            (WINDOW_WIDTH * RETINA_SCALE, WINDOW_HEIGHT * RETINA_SCALE),
+            (WINDOW_WIDTH, WINDOW_HEIGHT),
             method=Image.LANCZOS,
-            centering=(0.5, 0.5),
+            centering=BACKGROUND_CENTERING,
         )
     else:
         image = default_background_image()
@@ -130,8 +131,6 @@ def stage_payload(staging_dir: Path, app_bundle: Path) -> None:
     app_dst = staging_dir / f"{APP_NAME}.app"
     run(["cp", "-R", str(app_bundle), str(app_dst)])
     (staging_dir / "Applications").symlink_to("/Applications")
-    (staging_dir / ".hidden").write_text(".background\n.fseventsd\n.hidden\n")
-
     background_dir = staging_dir / BACKGROUND_DIR_NAME
     background_dir.mkdir()
     create_background_image(background_dir / BACKGROUND_FILE_NAME)
@@ -141,7 +140,6 @@ def hide_auxiliary_entries(mount_point: Path) -> None:
     hidden_names = (
         BACKGROUND_DIR_NAME,
         ".fseventsd",
-        ".hidden",
         ".Trashes",
         ".VolumeIcon.icns",
     )
@@ -149,6 +147,7 @@ def hide_auxiliary_entries(mount_point: Path) -> None:
         target = mount_point / name
         if target.exists():
             subprocess.run(["chflags", "hidden", str(target)], check=False)
+            subprocess.run(["SetFile", "-a", "V", str(target)], check=False)
 
 
 def customize_finder_window(mount_point: Path) -> None:
@@ -170,9 +169,7 @@ tell application "Finder"
         set background picture of icon view options of container window to file "{BACKGROUND_DIR_NAME}:{BACKGROUND_FILE_NAME}"
         set position of item "{APP_NAME}.app" to {{{APP_ICON_POSITION[0]}, {APP_ICON_POSITION[1]}}}
         set position of item "Applications" to {{{APPLICATIONS_ICON_POSITION[0]}, {APPLICATIONS_ICON_POSITION[1]}}}
-        if exists item ".background" then set position of item ".background" to {{1400, 1200}}
-        if exists item ".fseventsd" then set position of item ".fseventsd" to {{1550, 1200}}
-        if exists item ".hidden" then set position of item ".hidden" to {{1700, 1200}}
+        if exists item "{BACKGROUND_DIR_NAME}" then set position of item "{BACKGROUND_DIR_NAME}" to {{710, 75}}
         close
         open
         update without registering applications
@@ -193,6 +190,12 @@ end tell
         )
 
     hide_auxiliary_entries(mount_point)
+
+
+def remove_auxiliary_entries(mount_point: Path) -> None:
+    target = mount_point / ".fseventsd"
+    if target.exists():
+        subprocess.run(["rm", "-rf", str(target)], check=False)
 
 
 def build_dmg() -> Path:
@@ -242,6 +245,7 @@ def build_dmg() -> Path:
             raise RuntimeError("Could not determine mounted DMG path.")
 
         customize_finder_window(mount_point)
+        remove_auxiliary_entries(mount_point)
         run(["hdiutil", "detach", str(mount_point)])
 
         if DMG_PATH.exists():
