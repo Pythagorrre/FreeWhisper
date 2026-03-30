@@ -1,0 +1,18 @@
+{
+  "api_key": "",
+  "cohere_api_key": "",
+  "provider": "gladia",
+  "language": "fr",
+  "hotkey": "alt_r",
+  "hold_to_record": true,
+  "sample_rate": 16000,
+  "model": "solaria-1",
+  "code_switching": false,
+  "show_notifications": true,
+  "launch_at_startup": false,
+  "cancel_keycode": 53,
+  "hotkey_mod_flags": 0,
+  "hotkey_display": "Right Option",
+  "cancel_mod_flags": 0,
+  "cancel_display": "Escape"
+}

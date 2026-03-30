@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Memos Waveform Demo</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #000000; /* Fond très sombre pour contraster le conteneur */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            overflow: hidden;
+        }
+
+        .container {
+            width: 386px;
+            height: 110px;
+            background-color: #1C1C1E; /* Gris très foncé (Dark Mode iOS/macOS) */
+            border-radius: 14px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            /* Subtile bordure pour l'élégance "Glace/Verre" Apple */
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+            position: relative;
+        }
+
+        canvas {
+            display: block;
+            /* Laissons de la place pour simuler les boutons ou les marges internes */
+            width: 350px;
+            height: 60px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Exactement 0.5 seconde visible -->
+        <canvas id="waveformCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('waveformCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Gérer les écrans Retina (haute densité de pixels macOS) pour des lignes nettes
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        // --- Spécifications ---
+        const TIME_WINDOW_SEC = 0.5; // La largeur = exactement 0.5s d'audio
+        const BAR_WIDTH = 2;         // Fines
+        const BAR_GAP = 2;           // Espacement très serré (1 à 2px)
+        const BAR_TOTAL_W = BAR_WIDTH + BAR_GAP;
+        
+        // Couleur : Gris clair uni
+        const BAR_COLOR = '#D1D1D6'; 
+
+        // Calcul du nombre de barres qui tiennent physiquement dans le canvas
+        const NUM_BARS = Math.floor(rect.width / BAR_TOTAL_W) + 2; 
+
+        // Initialisation de l'historique d'audio
+        const history = new Array(NUM_BARS).fill(0.01);
+
+        // Paramètres pour le défilement fluide
+        let lastTime = performance.now();
+        let scrollOffset = 0; 
+        
+        // Vitesse = la largeur de l'écran parcourue en 0.5 secondes
+        const speedPxPerSec = rect.width / TIME_WINDOW_SEC; 
+
+        // Variables pour simuler une voix (générateur aléatoire)
+        let targetEnd = 0.1;
+        let currentEnd = 0.1;
+
+        function simulateVoiceActivity() {
+            // Modifie doucement l'onde pour de l'action vocale
+            if(Math.random() < 0.1) {
+                targetEnd = Math.random() * 0.9 + 0.1; // Pic occasionnel
+            } else {
+                targetEnd += (Math.random() - 0.5) * 0.3; // Dérive lissée
+            }
+            targetEnd = Math.max(0.05, Math.min(1.0, targetEnd));
+            currentEnd += (targetEnd - currentEnd) * 0.2;
+            
+            const noise = (Math.random() * 0.2 - 0.1) * currentEnd;
+            return Math.max(0.02, currentEnd + noise);
+        }
+
+        // --- Boucle d'animation (60 FPS Nativement via rAF) ---
+        function draw(time) {
+            requestAnimationFrame(draw);
+            
+            const dt = (time - lastTime) / 1000.0;
+            if (dt <= 0) return;
+            lastTime = time;
+
+            // Décalage pour le fluide continu (smooth scroll au sous-pixel)
+            scrollOffset += speedPxPerSec * dt;
+
+            // Insertion des nouvelles données lorsque l'espace dépasse la taille d'une barre
+            while(scrollOffset >= BAR_TOTAL_W) {
+                scrollOffset -= BAR_TOTAL_W;
+                history.shift(); // Enlève la plus ancienne
+                history.push(simulateVoiceActivity()); // Ajoute la plus récente
+            }
+
+            // --- Rendu ---
+            ctx.clearRect(0, 0, rect.width, rect.height);
+            ctx.fillStyle = BAR_COLOR;
+            const centerY = rect.height / 2;
+
+            for(let i = 0; i < history.length; i++) {
+                const val = history[i];
+                
+                // Mouvement continu vers la gauche! 
+                // Nouvelle barre arrive à droite, les anciennes sont poussées
+                const x = (i * BAR_TOTAL_W) - scrollOffset;
+                
+                // Ignorer les barres en dehors de l'écran
+                if(x + BAR_WIDTH < 0 || x > rect.width) continue;
+
+                // Hauteur minium 2px, s'étendant à partir du centre
+                const maxH = rect.height - 4; // Laisse un petit pad vertical
+                const h = Math.max(2, val * maxH);
+                const y = centerY - (h / 2);
+                
+                // Dessiner symétrie stricte (rectangles arrondis)
+                ctx.beginPath();
+                ctx.roundRect(x, y, BAR_WIDTH, h, BAR_WIDTH / 2);
+                ctx.fill();
+            }
+        }
+
+        // Lancer l'animation
+        requestAnimationFrame(draw);
+    </script>
+</body>
+</html>

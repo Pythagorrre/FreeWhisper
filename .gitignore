@@ -1,0 +1,32 @@
+# API keys and user configuration
+config.json
+
+# Usage tracking
+cohere_usage.json
+
+# Debug logs
+debug.log
+.freewhisper.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# macOS
+.DS_Store
+
+# PDF icon (PNG is sufficient)
+iconTemplate.pdf
+
+# Generated app bundles
+FreeWhisper.app/
+FWCore.app/
+
+# Legacy local artifacts
+Bottle.aiff
+Purr.aiff
+permissions_window.py

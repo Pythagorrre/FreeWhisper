@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>FreeWhisper UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background: transparent; 
+            margin: 0; 
+            overflow: hidden; 
+            -webkit-app-region: drag; /* Rendre glissable */
+            color: #d1d1d6; 
+        }
+        button, .key-badge { 
+            -webkit-app-region: no-drag; 
+        }
+        .key-badge { 
+            background: rgba(255, 255, 255, 0.12); 
+            border: 1px solid rgba(255, 255, 255, 0.15); 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3); 
+        }
+    </style>
+</head>
+<body style="width: 100%; height: 100vh; margin: 0; overflow: hidden; position: relative; background: #1C1C1E; border: 1px solid #3A3A3C; border-radius: 28px; box-sizing: border-box;" class="text-gray-300">
+
+    <!-- Waveform Area -->
+    <div style="position: absolute; top: 14px; left: 20px; right: 20px; height: 46px;" id="waveformContainer">
+        <canvas id="waveform" style="width: 100%; height: 100%;"></canvas>
+    </div>
+    
+    <!-- Bottom Controls (Bulle noire pleine largeur) -->
+    <div style="position: absolute; bottom: 10px; left: 12px; right: 12px; height: 30px;">
+        <div class="flex w-full h-full items-center justify-end gap-2 bg-black/70 backdrop-blur-md border border-white/5 shadow-sm rounded-xl px-3 transition-all duration-300 hover:bg-black/90" id="pillBox">
+            <button id="stopBtn" onclick="if(window.webkit) window.webkit.messageHandlers.pyBridge.postMessage(window.currentState === 'recording' ? 'stop' : 'cancel');" class="text-[12px] font-medium text-gray-400 hover:text-gray-200 transition-colors drop-shadow-sm cursor-pointer pr-0.5">
+                Cancel
+            </button>
+            <div id="cancelBadge" class="bg-[#2A2A2C] border border-white/10 rounded-md px-1.5 py-0.5 text-[9px] font-semibold text-gray-300 uppercase tracking-widest leading-none">esc</div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('waveform');
+        const ctx = canvas.getContext('2d');
+        
+        const barCount = 70;
+        const barWidth = 2.0;
+        const barGap = 2.5;
+        
+        let time = 0;
+        let internalTime = 0;
+        
+        let targetVolume = 0.05;
+        let activeVolume = 0.05;
+        
+        // Window State ('recording' OR 'waiting')
+        window.currentState = 'recording';
+        window.setCancelLabel = function(label) {
+            document.getElementById('cancelBadge').innerText = label;
+        };
+
+        window.setUIState = function(state) {
+            window.currentState = state;
+            if (state === 'waiting') {
+                document.getElementById('stopBtn').innerText = "Processing...";
+                time = 0;
+            } else {
+                document.getElementById('stopBtn').innerText = "Cancel";
+                activeVolume = 0.05;
+                targetVolume = 0.05;
+            }
+        };
+        
+        window.receiveAudioLevelArray = function(vals) {
+            if (window.currentState !== 'recording') return;
+            let maxVal = 0.05;
+            for(let i=0; i<vals.length; i++) {
+                if (vals[i] > maxVal) maxVal = vals[i];
+            }
+            targetVolume = Math.max(targetVolume, maxVal);
+        };
+
+        function resize() {
+            const container = document.getElementById('waveformContainer');
+            canvas.width = container.offsetWidth * window.devicePixelRatio;
+            canvas.height = container.offsetHeight * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+        
+        // Use an array to damp heights smoothly
+        let currentHeights = new Array(barCount).fill(2);
+        
+        function animate() {
+            const dpr = window.devicePixelRatio;
+            const width = canvas.width / dpr;
+            const height = canvas.height / dpr;
+            const centerY = height / 2;
+            
+            ctx.clearRect(0, 0, width, height);
+            
+            const totalWidth = barCount * (barWidth + barGap) - barGap;
+            const startX = (width - totalWidth) / 2;
+            
+            time += 0.15;
+            internalTime += 1;
+            
+            activeVolume += (targetVolume - activeVolume) * 0.2;
+            targetVolume = Math.max(0.05, targetVolume * 0.8);
+            
+            for (let i = 0; i < barCount; i++) {
+                const x = startX + i * (barWidth + barGap);
+                
+                const centerDist = Math.abs(i - barCount / 2) / (barCount / 2);
+                const envelope = 1 - Math.pow(centerDist, 2); 
+                
+                let targetHeight = 2;
+                
+                if (window.currentState === 'recording') {
+                    const wave1 = Math.sin(time * 2 + i * 0.4) * 0.5 + 0.5;
+                    const wave2 = Math.sin(time * 3.5 + i * 0.7) * Math.cos(time + i);
+                    const wave3 = Math.sin(time * 1.2 + i * 0.2);
+                    
+                    let amp = (wave1 * 0.6 + wave2 * 0.3 + wave3 * 0.1);
+                    amp = Math.abs(amp);
+                    amp = Math.pow(amp, 0.5); 
+                    
+                    amp *= envelope * (activeVolume * 3.0); 
+                    amp = Math.max(0.08, Math.min(1, amp));
+                    targetHeight = amp * height * 0.85;
+                } else if (window.currentState === 'waiting') {
+                    // CALM BREATHING (User's snippet logic)
+                    const wave1 = Math.sin(internalTime * 0.03 + i * 0.15) * 0.5 + 0.5;
+                    const wave2 = Math.sin(internalTime * 0.02 + i * 0.05) * 0.3 + 0.7;
+                    const combined = wave1 * wave2;
+                    let amp = combined * 0.35 + 0.05;
+                    amp *= envelope; // softly taper edges
+                    targetHeight = amp * height * 0.8;
+                }
+                
+                // Damping and smoothing
+                const damping = window.currentState === 'waiting' ? 0.12 : 0.4;
+                currentHeights[i] += (targetHeight - currentHeights[i]) * damping;
+                const barHeight = Math.max(2, currentHeights[i]);
+                const y = centerY - barHeight / 2;
+                
+                const baseOpacity = window.currentState === 'waiting' ? 0.15 : 0.3;
+                const dynOpacity = window.currentState === 'waiting' ? 0.3 : 0.7;
+                const activeAmp = barHeight / height;
+
+                ctx.fillStyle = `rgba(255, 255, 255, ${baseOpacity + activeAmp * dynOpacity})`;
+                
+                ctx.beginPath();
+                ctx.roundRect(x, y, barWidth, barHeight, barWidth / 2);
+                ctx.fill();
+            }
+            
+            requestAnimationFrame(animate);
+        }
+        
+        window.addEventListener('resize', resize);
+        resize();
+        requestAnimationFrame(animate);
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && window.webkit) {
+                window.webkit.messageHandlers.pyBridge.postMessage(window.currentState === 'recording' ? 'stop' : 'cancel');
+            }
+        });
+    </script>
+</body>
+</html>
