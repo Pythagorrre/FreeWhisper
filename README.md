@@ -1,7 +1,13 @@
+<p align="center">
+  <img src="docs/assets/app-icon.png" alt="FreeWhisper app icon" width="128" />
+</p>
+
 # FreeWhisper
 
 FreeWhisper is a lightweight macOS menu bar app for instant speech-to-text dictation.
 Press a hotkey, speak, release, and your words land where your cursor is.
+
+[Download the latest macOS app from Releases](https://github.com/Pythagorrre/FreeWhisper/releases)
 
 ## Why FreeWhisper
 
