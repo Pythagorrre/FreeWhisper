@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -152,10 +153,11 @@ def hide_auxiliary_entries(mount_point: Path) -> None:
 
 def customize_finder_window(mount_point: Path) -> None:
     hide_auxiliary_entries(mount_point)
+    disk_name = mount_point.name
 
     applescript = f'''
 tell application "Finder"
-    tell disk "{VOLUME_NAME}"
+    tell disk "{disk_name}"
         open
         delay 1
         set current view of container window to icon view
@@ -179,6 +181,17 @@ tell application "Finder"
 end tell
 '''
     subprocess.run(["osascript", "-e", applescript], check=True)
+
+    ds_store = mount_point / ".DS_Store"
+    for _ in range(40):
+        if ds_store.exists():
+            break
+        time.sleep(0.25)
+    else:
+        raise RuntimeError(
+            f"Finder layout was not persisted for {mount_point}; .DS_Store is missing."
+        )
+
     hide_auxiliary_entries(mount_point)
 
 
