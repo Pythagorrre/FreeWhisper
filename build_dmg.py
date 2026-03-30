@@ -24,7 +24,7 @@ APP_ICON_POSITION = (230, 280)
 APPLICATIONS_ICON_POSITION = (760, 280)
 ICON_SIZE = 160
 RETINA_SCALE = 2
-CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "image1.png"
+CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "dmg-background-clean.png"
 BUNDLE_CANDIDATES = (
     BUNDLE_PATH,
     Path("/Applications") / f"{APP_NAME}.app",
@@ -65,29 +65,6 @@ def default_background_image() -> Image.Image:
             int((1 - mix) * top_color[i] + mix * bottom_color[i]) for i in range(3)
         )
         draw.line((0, y, width, y), fill=row)
-
-    blob_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    blob_draw = ImageDraw.Draw(blob_layer)
-    blob_draw.ellipse((70, 40, 520, 330), fill=(255, 255, 255, 150))
-    blob_draw.ellipse((740, 55, 1190, 345), fill=(255, 255, 255, 130))
-    blob_draw.ellipse((380, 430, 860, 760), fill=(215, 228, 244, 170))
-    blob_layer = blob_layer.filter(ImageFilter.GaussianBlur(24))
-    image.alpha_composite(blob_layer)
-
-    shadow_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    shadow_draw = ImageDraw.Draw(shadow_layer)
-    shadow_draw.rounded_rectangle(
-        (470, 190, 690, 390),
-        radius=48,
-        fill=(120, 132, 148, 70),
-    )
-    shadow_draw.rounded_rectangle(
-        (300, 240, 580, 340),
-        radius=46,
-        fill=(120, 132, 148, 70),
-    )
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(18))
-    image.alpha_composite(shadow_layer)
 
     arrow_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     arrow_draw = ImageDraw.Draw(arrow_layer)
@@ -133,18 +110,20 @@ def soften_live_drop_targets(image: Image.Image) -> Image.Image:
         half_h = int(height * scale_y / 2)
         return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
+    # Remove the baked text from the artwork so Finder can render the live labels
+    # cleanly, while keeping the arrow and decorative atmosphere.
     draw.rounded_rectangle(
-        center_box((APP_ICON_POSITION[0], APP_ICON_POSITION[1] + 152), 350, 92),
-        radius=int(34 * scale_x),
-        fill=(255, 255, 255, 244),
+        center_box((APP_ICON_POSITION[0], APP_ICON_POSITION[1] + 152), 320, 72),
+        radius=int(26 * scale_x),
+        fill=(248, 250, 253, 246),
     )
     draw.rounded_rectangle(
-        center_box((APPLICATIONS_ICON_POSITION[0], APPLICATIONS_ICON_POSITION[1] + 152), 330, 92),
-        radius=int(34 * scale_x),
-        fill=(255, 255, 255, 244),
+        center_box((APPLICATIONS_ICON_POSITION[0], APPLICATIONS_ICON_POSITION[1] + 152), 300, 72),
+        radius=int(26 * scale_x),
+        fill=(248, 250, 253, 246),
     )
 
-    overlay = overlay.filter(ImageFilter.GaussianBlur(int(22 * scale_x)))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(int(14 * scale_x)))
     image.alpha_composite(overlay)
     return image
 
@@ -169,6 +148,7 @@ def stage_payload(staging_dir: Path, app_bundle: Path) -> None:
     app_dst = staging_dir / f"{APP_NAME}.app"
     run(["cp", "-R", str(app_bundle), str(app_dst)])
     (staging_dir / "Applications").symlink_to("/Applications")
+    (staging_dir / ".hidden").write_text(".background\n.fseventsd\n.hidden\n")
 
     background_dir = staging_dir / BACKGROUND_DIR_NAME
     background_dir.mkdir()
@@ -179,6 +159,7 @@ def hide_auxiliary_entries(mount_point: Path) -> None:
     hidden_names = (
         BACKGROUND_DIR_NAME,
         ".fseventsd",
+        ".hidden",
         ".Trashes",
         ".VolumeIcon.icns",
     )
@@ -206,6 +187,9 @@ tell application "Finder"
         set background picture of icon view options of container window to file "{BACKGROUND_DIR_NAME}:{BACKGROUND_FILE_NAME}"
         set position of item "{APP_NAME}.app" to {{{APP_ICON_POSITION[0]}, {APP_ICON_POSITION[1]}}}
         set position of item "Applications" to {{{APPLICATIONS_ICON_POSITION[0]}, {APPLICATIONS_ICON_POSITION[1]}}}
+        if exists item ".background" then set position of item ".background" to {{1400, 1200}}
+        if exists item ".fseventsd" then set position of item ".fseventsd" to {{1550, 1200}}
+        if exists item ".hidden" then set position of item ".hidden" to {{1700, 1200}}
         close
         open
         update without registering applications
