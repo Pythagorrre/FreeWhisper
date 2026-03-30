@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 from build_standalone_app import APP_NAME, BUNDLE_PATH, build_bundle
 
@@ -23,6 +23,8 @@ WINDOW_HEIGHT = WINDOW_BOUNDS[3] - WINDOW_BOUNDS[1]
 APP_ICON_POSITION = (230, 280)
 APPLICATIONS_ICON_POSITION = (760, 280)
 ICON_SIZE = 160
+RETINA_SCALE = 2
+CUSTOM_BACKGROUND_SOURCE = ROOT / "docs" / "assets" / "image1.png"
 BUNDLE_CANDIDATES = (
     BUNDLE_PATH,
     Path("/Applications") / f"{APP_NAME}.app",
@@ -50,8 +52,8 @@ def ensure_app_bundle() -> Path:
     return BUNDLE_PATH
 
 
-def create_background_image(path: Path) -> None:
-    width, height = WINDOW_WIDTH * 2, WINDOW_HEIGHT * 2
+def default_background_image() -> Image.Image:
+    width, height = WINDOW_WIDTH * RETINA_SCALE, WINDOW_HEIGHT * RETINA_SCALE
     image = Image.new("RGBA", (width, height), "#f4f7fb")
     draw = ImageDraw.Draw(image)
 
@@ -113,6 +115,52 @@ def create_background_image(path: Path) -> None:
     ):
         cloud_draw.ellipse(ellipse, fill=cloud_fill)
     image.alpha_composite(cloud_layer)
+
+    return image
+
+
+def soften_live_drop_targets(image: Image.Image) -> Image.Image:
+    scale_x = image.width / WINDOW_WIDTH
+    scale_y = image.height / WINDOW_HEIGHT
+
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    def center_box(center: tuple[int, int], width: int, height: int) -> tuple[int, int, int, int]:
+        cx = int(center[0] * scale_x)
+        cy = int(center[1] * scale_y)
+        half_w = int(width * scale_x / 2)
+        half_h = int(height * scale_y / 2)
+        return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+    draw.rounded_rectangle(
+        center_box((APP_ICON_POSITION[0], APP_ICON_POSITION[1] + 152), 350, 92),
+        radius=int(34 * scale_x),
+        fill=(255, 255, 255, 244),
+    )
+    draw.rounded_rectangle(
+        center_box((APPLICATIONS_ICON_POSITION[0], APPLICATIONS_ICON_POSITION[1] + 152), 330, 92),
+        radius=int(34 * scale_x),
+        fill=(255, 255, 255, 244),
+    )
+
+    overlay = overlay.filter(ImageFilter.GaussianBlur(int(22 * scale_x)))
+    image.alpha_composite(overlay)
+    return image
+
+
+def create_background_image(path: Path) -> None:
+    if CUSTOM_BACKGROUND_SOURCE.exists():
+        image = Image.open(CUSTOM_BACKGROUND_SOURCE).convert("RGBA")
+        image = ImageOps.fit(
+            image,
+            (WINDOW_WIDTH * RETINA_SCALE, WINDOW_HEIGHT * RETINA_SCALE),
+            method=Image.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        image = soften_live_drop_targets(image)
+    else:
+        image = default_background_image()
 
     image.convert("RGB").save(path)
 
