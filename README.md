@@ -63,10 +63,10 @@ FreeWhisper is designed around three simple surfaces:
 
 ## Install
 
-The recommended path for most users is the standalone app bundle.
+The recommended path for most users is the DMG release.
 
-1. Download the latest `FreeWhisper.app.zip` from the GitHub Releases page.
-2. Unzip it.
+1. Download the latest `FreeWhisper.dmg` from the GitHub Releases page.
+2. Open the DMG.
 3. Drag `FreeWhisper.app` into `/Applications`.
 4. Open `FreeWhisper.app`.
 5. If macOS warns that the app cannot be verified, right-click the app, choose `Open`, then confirm once.
@@ -136,6 +136,12 @@ To rebuild the standalone app bundle locally:
 
 ```bash
 python3 build_standalone_app.py
+```
+
+To build the drag-and-drop DMG installer:
+
+```bash
+python3 build_dmg.py
 ```
 
 ## Tech Stack

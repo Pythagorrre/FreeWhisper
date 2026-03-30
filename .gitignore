@@ -25,6 +25,8 @@ iconTemplate.pdf
 # Generated app bundles
 FreeWhisper.app/
 FWCore.app/
+*.dmg
+*.zip
 
 # Legacy local artifacts
 Bottle.aiff
