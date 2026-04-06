@@ -453,15 +453,39 @@ def load_config():
     return cfg
 
 
+def _read_clipboard_bytes():
+    paste_res = subprocess.run(["pbpaste"], capture_output=True, check=False)
+    if paste_res.returncode != 0:
+        log.debug(f"_read_clipboard_bytes FAILED rc={paste_res.returncode}")
+        return None
+    return paste_res.stdout
+
+
+def _schedule_clipboard_restore(saved, delay=0.75, label="clipboard restore"):
+    if saved is None:
+        log.debug(f"{label} skipped (no saved clipboard)")
+        return False
+
+    def _restore_clipboard():
+        if delay > 0:
+            time.sleep(delay)
+        restore_res = subprocess.run(["pbcopy"], input=saved, check=False)
+        if restore_res.returncode != 0:
+            log.debug(f"{label} FAILED rc={restore_res.returncode}")
+        else:
+            log.debug(f"{label} OK")
+
+    threading.Thread(target=_restore_clipboard, daemon=True).start()
+    return True
+
+
 def paste_at_cursor(text, restore_clipboard=True, prefer_applescript=False, target_pid=None):
     """Paste text at cursor via clipboard and the most suitable paste method."""
     log.debug(f"paste_at_cursor start len={len(text)}")
-    saved = None
-    if restore_clipboard:
-        saved = subprocess.run(["pbpaste"], capture_output=True, check=False).stdout
+    saved = _read_clipboard_bytes() if restore_clipboard else None
     if not copy_text_to_clipboard(text):
         log.debug("paste_at_cursor aborted (clipboard copy failed)")
-        return False
+        return False, saved
 
     def _post_key(keycode, is_down, flags=0):
         event = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
@@ -517,19 +541,17 @@ def paste_at_cursor(text, restore_clipboard=True, prefer_applescript=False, targ
         if not pasted:
             pasted = _send_applescript_paste()
 
-    if restore_clipboard and saved is not None:
-        def _restore_clipboard():
-            time.sleep(0.75)
-            restore_res = subprocess.run(["pbcopy"], input=saved, check=False)
-            if restore_res.returncode != 0:
-                log.debug(f"paste_at_cursor clipboard restore FAILED rc={restore_res.returncode}")
-            else:
-                log.debug("paste_at_cursor clipboard restored")
-
-        threading.Thread(target=_restore_clipboard, daemon=True).start()
+    if restore_clipboard and pasted:
+        _schedule_clipboard_restore(
+            saved,
+            delay=0.75,
+            label="paste_at_cursor clipboard restore",
+        )
+    elif restore_clipboard:
+        log.debug("paste_at_cursor paste failed; leaving transcript in clipboard as fallback")
     else:
         log.debug("paste_at_cursor leaving transcript in clipboard")
-    return pasted
+    return pasted, saved
 
 
 def insert_text_at_cursor(text, target_pid=None):
@@ -1650,12 +1672,12 @@ class FreeWhisperApp(rumps.App):
 
         inserted = False
         copied_only = False
+        clipboard_backup = None
         target_capability = self._target_text_input_capability()
         if target_capability == "none":
-            copy_text_to_clipboard(final)
-            inserted = paste_at_cursor(
+            inserted, clipboard_backup = paste_at_cursor(
                 final,
-                restore_clipboard=False,
+                restore_clipboard=True,
                 prefer_applescript=False,
                 target_pid=self._target_app_pid,
             )
@@ -1664,11 +1686,16 @@ class FreeWhisperApp(rumps.App):
             else:
                 inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
                 if inserted:
+                    _schedule_clipboard_restore(
+                        clipboard_backup,
+                        delay=0.0,
+                        label="_deliver_result_main_thread clipboard restore after unicode fallback",
+                    )
                     log.debug("_deliver_result_main_thread used direct unicode typing fallback")
         else:
-            inserted = paste_at_cursor(
+            inserted, clipboard_backup = paste_at_cursor(
                 final,
-                restore_clipboard=False,
+                restore_clipboard=True,
                 prefer_applescript=False,
                 target_pid=self._target_app_pid,
             )
@@ -1679,11 +1706,23 @@ class FreeWhisperApp(rumps.App):
             inserted = self._insert_text_via_accessibility(final)
             if not inserted:
                 inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
+            if inserted:
+                _schedule_clipboard_restore(
+                    clipboard_backup,
+                    delay=0.0,
+                    label="_deliver_result_main_thread clipboard restore after strong fallback",
+                )
         elif not inserted and target_capability == "weak":
             log.debug(
-                "_deliver_result_main_thread weak text target -> AX insert + keep clipboard backup"
+                "_deliver_result_main_thread weak text target -> AX insert fallback"
             )
             inserted = self._insert_text_via_accessibility(final)
+            if inserted:
+                _schedule_clipboard_restore(
+                    clipboard_backup,
+                    delay=0.0,
+                    label="_deliver_result_main_thread clipboard restore after weak fallback",
+                )
         elif not inserted:
             log.debug("_deliver_result_main_thread no text target -> clipboard only")
 
