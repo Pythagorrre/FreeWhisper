@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "FreeWhisper"
+APP_VERSION = "1.0.1"
 BUNDLE_ID = "com.freewhisper.app"
 BUNDLE_PATH = ROOT / f"{APP_NAME}.app"
 
@@ -64,8 +65,8 @@ def write_info_plist(path: Path) -> None:
         "CFBundleIdentifier": BUNDLE_ID,
         "CFBundleName": APP_NAME,
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.0",
-        "CFBundleVersion": "1.0",
+        "CFBundleShortVersionString": APP_VERSION,
+        "CFBundleVersion": APP_VERSION,
         "LSUIElement": True,
         "NSAppleEventsUsageDescription": (
             "FreeWhisper needs to paste transcribed text into your active application."
