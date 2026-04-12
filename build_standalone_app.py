@@ -56,6 +56,15 @@ def copy_file(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+def remove_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
 def write_info_plist(path: Path) -> None:
     info = {
         "CFBundleDisplayName": APP_NAME,
@@ -188,6 +197,30 @@ def sign_runtime(bundle_path: Path) -> None:
     run(["codesign", "--force", "--deep", "--sign", "-", str(bundle_path)])
 
 
+def prune_python_runtime(version_root: Path) -> None:
+    stdlib_root = version_root / "lib" / f"python{PYTHON_VERSION}"
+    removable_paths = (
+        version_root / "share",
+        version_root / "Resources" / "English.lproj",
+        stdlib_root / "ensurepip",
+        stdlib_root / "idlelib",
+        stdlib_root / "test",
+        stdlib_root / "turtledemo",
+        stdlib_root / "venv",
+    )
+
+    for path in removable_paths:
+        remove_path(path)
+
+    for cache_dir in version_root.rglob("__pycache__"):
+        remove_path(cache_dir)
+
+    site_packages_root = stdlib_root / "site-packages"
+    for pattern in ("pip", "pip-*.dist-info"):
+        for path in site_packages_root.glob(pattern):
+            remove_path(path)
+
+
 def copy_python_runtime(bundle_path: Path) -> None:
     framework_root = bundle_path / "Contents" / "Frameworks" / "Python.framework"
     framework_version_dst = framework_root / "Versions" / PYTHON_VERSION
@@ -208,7 +241,9 @@ def copy_python_runtime(bundle_path: Path) -> None:
     site_packages_dst = (
         framework_version_dst / "lib" / f"python{PYTHON_VERSION}" / "site-packages"
     )
-    shutil.copytree(SITE_PACKAGES_SRC, site_packages_dst, dirs_exist_ok=True, symlinks=True)
+    remove_path(site_packages_dst)
+    shutil.copytree(SITE_PACKAGES_SRC, site_packages_dst, symlinks=True)
+    prune_python_runtime(framework_version_dst)
 
     rewrite_macho_paths(bundle_path)
 
