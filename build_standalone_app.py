@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "FreeWhisper"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 BUNDLE_ID = "com.freewhisper.app"
 BUNDLE_PATH = ROOT / f"{APP_NAME}.app"
 
