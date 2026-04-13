@@ -42,7 +42,13 @@ import certifi
 import Quartz
 import ApplicationServices as AS
 from PyObjCTools import AppHelper
-from app_runtime import canonical_app_bundle_path, launch_program_arguments
+from app_runtime import (
+    canonical_app_bundle_path,
+    check_for_update,
+    download_and_apply_update,
+    launch_program_arguments,
+    open_latest_release_page,
+)
 from overlay import OverlayWindow
 from settings_window import SettingsWindow
 from app_paths import BUNDLE_ID
@@ -694,10 +700,14 @@ class FreeWhisperApp(rumps.App):
 
         self.menu = [
             rumps.MenuItem("Settings", callback=self._open_settings),
+            rumps.MenuItem("Check for Updates...", callback=self._check_for_updates),
         ]
 
         self._start_listener()
         AppHelper.callAfter(self._apply_menu_bar_icon_visibility)
+
+        if self.cfg.get("auto_update", False):
+            threading.Thread(target=self._auto_update_on_launch, daemon=True).start()
 
     # ── Hotkey listener (Quartz CGEvent tap) ────────────────
 
@@ -2032,6 +2042,106 @@ class FreeWhisperApp(rumps.App):
             start_new_session=True,
         )
         rumps.quit_application()
+
+    def _auto_update_on_launch(self):
+        """Background auto-update: check GitHub and install silently."""
+        try:
+            result = check_for_update()
+        except Exception:
+            log.exception("Auto-update check failed at launch")
+            return
+        if result is None:
+            log.debug("Auto-update: already up to date")
+            return
+        latest_version, dmg_url = result
+        log.debug("Auto-update: installing %s", latest_version)
+        try:
+            download_and_apply_update(dmg_url)
+        except Exception:
+            log.exception("Auto-update install failed")
+
+    def _check_for_updates(self, _):
+        log.debug("Menu requested update check")
+
+        def _do_check():
+            try:
+                result = check_for_update()
+            except Exception:
+                log.exception("Update check failed")
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "Update Check Failed",
+                        "Could not reach GitHub. Please check your internet connection.",
+                    )
+                )
+                return
+
+            if result is None:
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "You're Up to Date",
+                        "FreeWhisper is already the latest version.",
+                    )
+                )
+            else:
+                latest_version, dmg_url = result
+                AppHelper.callAfter(
+                    lambda v=latest_version, u=dmg_url: self._offer_update(v, u)
+                )
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    @staticmethod
+    def _app_icon():
+        from app_paths import CONTENTS_DIR
+        if CONTENTS_DIR:
+            icon_path = os.path.join(CONTENTS_DIR, "Resources", "FreeWhisper.icns")
+            if os.path.exists(icon_path):
+                return AppKit.NSImage.alloc().initWithContentsOfFile_(icon_path)
+        return None
+
+    def _show_update_alert(self, title: str, message: str):
+        alert = AppKit.NSAlert.alloc().init()
+        icon = self._app_icon()
+        if icon:
+            alert.setIcon_(icon)
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+
+    def _offer_update(self, version: str, dmg_url: str):
+        alert = AppKit.NSAlert.alloc().init()
+        icon = self._app_icon()
+        if icon:
+            alert.setIcon_(icon)
+        alert.setMessageText_(f"Update Available — v{version}")
+        alert.setInformativeText_(
+            f"A new version of FreeWhisper ({version}) is available.\n\n"
+            "Would you like to download and install it now? "
+            "The app will restart automatically."
+        )
+        alert.addButtonWithTitle_("Update Now")
+        alert.addButtonWithTitle_("Later")
+        if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
+            return
+
+        log.debug("User accepted update to %s", version)
+
+        def _do_update():
+            try:
+                download_and_apply_update(dmg_url)
+            except Exception:
+                log.exception("Auto-update failed")
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "Update Failed",
+                        "The update could not be installed. "
+                        "You can download it manually from GitHub.",
+                    )
+                )
+
+        threading.Thread(target=_do_update, daemon=True).start()
 
 
 if __name__ == "__main__":

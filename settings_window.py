@@ -9,7 +9,12 @@ import ctypes.util
 import logging
 import objc
 import AppKit
-from app_runtime import launch_program_arguments
+from app_runtime import (
+    check_for_update,
+    download_and_apply_update,
+    launch_program_arguments,
+    open_latest_release_page,
+)
 from app_paths import ensure_user_data_file, resource_path, user_support_path
 from AppKit import (
     NSWindow, NSView, NSTextField, NSImageView,
@@ -93,9 +98,19 @@ FLAGS = {
     "ko": "🇰🇷", "auto": "🌐",
 }
 
+def _app_icon():
+    """Return the FreeWhisper app icon as an NSImage, or None."""
+    from app_paths import CONTENTS_DIR
+    if CONTENTS_DIR:
+        icon_path = os.path.join(CONTENTS_DIR, "Resources", "FreeWhisper.icns")
+        if os.path.exists(icon_path):
+            return NSImage.alloc().initWithContentsOfFile_(icon_path)
+    return None
+
+
 # ── Layout constants ──────────────────────────────────────
 WIN_W = 700
-WIN_H = 650
+WIN_H = 690
 PAD = 20
 ROW_H = 32
 LABEL_W = 180
@@ -396,6 +411,11 @@ class _SettingsBridge(AppKit.NSObject):
         s = self.settings_ref
         if s:
             s._open_permissions_settings()
+
+    def updatesClicked_(self, sender):
+        s = self.settings_ref
+        if s:
+            s._check_for_updates()
 
     def windowShouldClose_(self, sender):
         s = self.settings_ref
@@ -746,6 +766,7 @@ class SettingsWindow:
         self._initial_launch_at_startup = cfg.get("launch_at_startup",
                                                    _is_launch_at_startup())
         self._initial_show_menu_bar_icon = cfg.get("show_menu_bar_icon", True)
+        self._initial_auto_update = cfg.get("auto_update", False)
 
         # Key visibility — start hidden
         self._gladia_key_value = self._initial_api_key
@@ -948,6 +969,22 @@ class SettingsWindow:
         self._menu_bar_icon_switch.setState_(
             1 if self._initial_show_menu_bar_icon else 0)
         view.addSubview_(keep(self._menu_bar_icon_switch))
+        _top = y - 8
+
+        # Automatic updates toggle
+        y = _top - ROW_H
+        view.addSubview_(keep(_make_label("Automatic updates", y)))
+        if _NSSwitch is not None:
+            self._auto_update_switch = _NSSwitch.alloc().initWithFrame_(
+                ((field_x + 7, y + 4), (38, 22)))
+        else:
+            self._auto_update_switch = NSButton.alloc().initWithFrame_(
+                ((field_x, y), (50, ROW_H)))
+            self._auto_update_switch.setButtonType_(3)
+            self._auto_update_switch.setTitle_("")
+        self._auto_update_switch.setState_(
+            1 if self._initial_auto_update else 0)
+        view.addSubview_(keep(self._auto_update_switch))
         _top = y - 20
 
         # ════════════════ EXTERNAL TRANSCRIPTION ENGINES ═════
@@ -982,9 +1019,23 @@ class SettingsWindow:
         _top = cohere_y - 20
 
         # ════════════════ SAVE BUTTON ════════════════════════
-        btn_w, btn_h = 140, 36
+        btn_w, btn_h = 160, 36
+        btn_gap = 12
+        buttons_y = _top - btn_h
+        total_w = btn_w * 2 + btn_gap
+        buttons_x = (WIN_W - total_w) / 2
+
+        update_btn = NSButton.alloc().initWithFrame_(
+            ((buttons_x, buttons_y), (btn_w, btn_h)))
+        update_btn.setTitle_("Check for Updates")
+        update_btn.setBezelStyle_(NSBezelStyleRounded)
+        update_btn.setFont_(NSFont.systemFontOfSize_(13))
+        update_btn.setTarget_(self._bridge)
+        update_btn.setAction_(b"updatesClicked:")
+        view.addSubview_(keep(update_btn))
+
         save_btn = NSButton.alloc().initWithFrame_(
-            (((WIN_W - btn_w) / 2, _top - btn_h), (btn_w, btn_h)))
+            ((buttons_x + btn_w + btn_gap, buttons_y), (btn_w, btn_h)))
         save_btn.setTitle_("Save & Restart")
         save_btn.setBezelStyle_(NSBezelStyleRounded)
         save_btn.setFont_(NSFont.systemFontOfSize_(13))
@@ -1015,6 +1066,86 @@ class SettingsWindow:
             subprocess.Popen(["open", ACCESSIBILITY_SETTINGS_URL])
         except Exception:
             pass
+
+    def _open_latest_release(self):
+        try:
+            open_latest_release_page()
+        except Exception:
+            log.exception("Failed to open latest GitHub release page")
+
+    def _check_for_updates(self):
+        from PyObjCTools import AppHelper
+
+        def _do_check():
+            try:
+                result = check_for_update()
+            except Exception:
+                log.exception("Update check failed")
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "Update Check Failed",
+                        "Could not reach GitHub. Please check your internet connection.",
+                    )
+                )
+                return
+
+            if result is None:
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "You're Up to Date",
+                        "FreeWhisper is already the latest version.",
+                    )
+                )
+            else:
+                latest_version, dmg_url = result
+                AppHelper.callAfter(
+                    lambda v=latest_version, u=dmg_url: self._offer_update(v, u)
+                )
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
+    def _show_update_alert(self, title: str, message: str):
+        alert = AppKit.NSAlert.alloc().init()
+        icon = _app_icon()
+        if icon:
+            alert.setIcon_(icon)
+        alert.setMessageText_(title)
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+
+    def _offer_update(self, version: str, dmg_url: str):
+        alert = AppKit.NSAlert.alloc().init()
+        icon = _app_icon()
+        if icon:
+            alert.setIcon_(icon)
+        alert.setMessageText_(f"Update Available — v{version}")
+        alert.setInformativeText_(
+            f"A new version of FreeWhisper ({version}) is available.\n\n"
+            "Would you like to download and install it now? "
+            "The app will restart automatically."
+        )
+        alert.addButtonWithTitle_("Update Now")
+        alert.addButtonWithTitle_("Later")
+        if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
+            return
+
+        log.debug("User accepted update to %s", version)
+
+        def _do_update():
+            try:
+                download_and_apply_update(dmg_url)
+            except Exception:
+                log.exception("Auto-update failed")
+                AppHelper.callAfter(
+                    lambda: self._show_update_alert(
+                        "Update Failed",
+                        "The update could not be installed. "
+                        "You can download it manually from GitHub.",
+                    )
+                )
+
+        threading.Thread(target=_do_update, daemon=True).start()
 
     def _on_provider_changed(self, provider):
         auto_idx = self._lang_codes.index("auto") if "auto" in self._lang_codes else -1
@@ -1305,6 +1436,8 @@ class SettingsWindow:
         if ((self._menu_bar_icon_switch.state() == 1)
                 != self._initial_show_menu_bar_icon):
             return True
+        if (self._auto_update_switch.state() == 1) != self._initial_auto_update:
+            return True
         return False
 
     def _confirm_close(self):
@@ -1312,6 +1445,9 @@ class SettingsWindow:
         if not self._has_changes():
             return True
         alert = AppKit.NSAlert.alloc().init()
+        icon = _app_icon()
+        if icon:
+            alert.setIcon_(icon)
         alert.setMessageText_("Unsaved changes")
         alert.setInformativeText_(
             "You have unsaved changes. Do you want to discard them?")
@@ -1359,6 +1495,7 @@ class SettingsWindow:
         cfg["provider"] = provider
         cfg["launch_at_startup"] = launch_at_startup
         cfg["show_menu_bar_icon"] = show_menu_bar_icon
+        cfg["auto_update"] = self._auto_update_switch.state() == 1
         mic_idx = self._mic_popup.indexOfSelectedItem()
         cfg["input_device"] = self._mic_devices[mic_idx]
 

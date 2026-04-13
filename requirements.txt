@@ -5,3 +5,4 @@ websocket-client>=1.6.0
 requests>=2.31.0
 pynput>=1.7.6
 pyobjc-framework-Quartz>=9.0
+pyobjc-framework-WebKit>=9.0
