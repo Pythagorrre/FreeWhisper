@@ -88,6 +88,11 @@ MODIFIER_KEYS = {
 REGULAR_KEYS = {
     "`": 42,
 }
+REGULAR_KEY_ALIASES = {
+    # Different Mac keyboard layouts report the grave/backtick key as either
+    # ANSI backslash (42) or ANSI grave (50). Treat both as the same hotkey.
+    "`": (42, 50),
+}
 MODIFIER_KEYCODE_FLAGS = {keycode: flag for keycode, flag in MODIFIER_KEYS.values()}
 
 
@@ -131,6 +136,7 @@ _SHOW_SETTINGS_NOTIFICATION = f"{BUNDLE_ID}.show-settings"
 # ── Module-level CGEvent tap callback (avoids GC issues) ──
 _app_ref = None
 _target_keycode = 0
+_target_keycodes = ()
 _target_flag = 0            # 0 = regular key, >0 = modifier flag mask
 _required_mod_flags = 0     # additional modifier flags for combos
 _hold_to_record = True
@@ -233,6 +239,16 @@ def _is_keycode_pressed(keycode):
         return False
 
 
+def _hotkey_keycode_matches(keycode):
+    if _target_flag:
+        return keycode == _target_keycode
+    return keycode in _target_keycodes
+
+
+def _regular_hotkey_is_pressed():
+    return any(_is_keycode_pressed(keycode) for keycode in _target_keycodes)
+
+
 def _modifier_hotkey_is_active(flags):
     required = _target_flag | _required_mod_flags
     if (_masked_hotkey_flags(flags) & required) != required:
@@ -257,6 +273,9 @@ def _toggle_hotkey_action(source, keycode, flags):
         log.debug(f"{source} TOGGLE is_recording={rec} keycode={keycode} flags=0x{flags:08x}")
         if rec:
             _app_ref._on_hotkey_up()
+        elif _app_ref._can_cancel_current_operation():
+            log.debug(f"{source} TOGGLE cancel active processing")
+            _app_ref._do_cancel()
         else:
             _app_ref._on_hotkey_down()
 
@@ -265,11 +284,15 @@ def _handle_hotkey_event(kind, keycode, flags, source):
     global _hotkey_pressed
 
     mod_flags = _masked_hotkey_flags(flags)
-    suppress = (not _target_flag and keycode == _target_keycode
+    suppress = (not _target_flag and _hotkey_keycode_matches(keycode)
                 and kind in ("down", "up"))
 
     if kind == "down" and keycode == _cancel_keycode:
-        if mod_flags == _cancel_mod_flags and _app_ref and _app_ref.is_recording:
+        if (
+            mod_flags == _cancel_mod_flags
+            and _app_ref
+            and _app_ref._can_cancel_current_operation()
+        ):
             log.debug(f"{source} global cancel -> CANCEL")
             _app_ref._do_cancel()
             return True
@@ -292,7 +315,7 @@ def _handle_hotkey_event(kind, keycode, flags, source):
                     _app_ref._on_hotkey_up()
             return suppress
 
-        if kind == "down" and keycode == _target_keycode:
+        if kind == "down" and _hotkey_keycode_matches(keycode):
             if mod_flags == _required_mod_flags and not _hotkey_pressed:
                 _hotkey_pressed = True
                 log.debug(f"{source} HOTKEY DOWN keycode={keycode} flags=0x{flags:08x}")
@@ -300,11 +323,11 @@ def _handle_hotkey_event(kind, keycode, flags, source):
                     _app_ref._on_hotkey_down()
             return suppress
 
-        if kind == "up" and keycode == _target_keycode:
+        if kind == "up" and _hotkey_keycode_matches(keycode):
             if _hotkey_pressed:
                 # Some non-modifier keys can emit a spurious key-up while they
                 # are still physically held. Trust key state over the raw event.
-                if _is_keycode_pressed(_target_keycode):
+                if _regular_hotkey_is_pressed():
                     log.debug(f"{source} HOTKEY UP ignored (key still pressed) keycode={keycode} flags=0x{flags:08x}")
                 else:
                     _hotkey_pressed = False
@@ -334,13 +357,13 @@ def _handle_hotkey_event(kind, keycode, flags, source):
             _hotkey_pressed = False
         return suppress
 
-    if kind == "down" and keycode == _target_keycode:
+    if kind == "down" and _hotkey_keycode_matches(keycode):
         if mod_flags == _required_mod_flags and not _hotkey_pressed:
             _hotkey_pressed = True
             _toggle_hotkey_action(source, keycode, flags)
         return suppress
 
-    if kind == "up" and keycode == _target_keycode:
+    if kind == "up" and _hotkey_keycode_matches(keycode):
         _hotkey_pressed = False
         return suppress
 
@@ -459,49 +482,33 @@ def load_config():
     return cfg
 
 
-def _read_clipboard_bytes():
-    paste_res = subprocess.run(["pbpaste"], capture_output=True, check=False)
-    if paste_res.returncode != 0:
-        log.debug(f"_read_clipboard_bytes FAILED rc={paste_res.returncode}")
-        return None
-    return paste_res.stdout
-
-
-def _schedule_clipboard_restore(saved, delay=0.75, label="clipboard restore"):
-    if saved is None:
-        log.debug(f"{label} skipped (no saved clipboard)")
+def _accessibility_trusted():
+    try:
+        return bool(AS.AXIsProcessTrusted())
+    except Exception as e:
+        log.debug(f"_accessibility_trusted check FAILED: {e}")
         return False
 
-    def _restore_clipboard():
-        if delay > 0:
-            time.sleep(delay)
-        restore_res = subprocess.run(["pbcopy"], input=saved, check=False)
-        if restore_res.returncode != 0:
-            log.debug(f"{label} FAILED rc={restore_res.returncode}")
-        else:
-            log.debug(f"{label} OK")
 
-    threading.Thread(target=_restore_clipboard, daemon=True).start()
-    return True
-
-
-def paste_at_cursor(text, restore_clipboard=True, prefer_applescript=False, target_pid=None):
-    """Paste text at cursor via clipboard and the most suitable paste method."""
+def paste_at_cursor(text, prefer_applescript=False, target_pid=None):
+    """Paste text at cursor via clipboard and leave it available for reuse."""
     log.debug(f"paste_at_cursor start len={len(text)}")
-    saved = _read_clipboard_bytes() if restore_clipboard else None
     if not copy_text_to_clipboard(text):
         log.debug("paste_at_cursor aborted (clipboard copy failed)")
-        return False, saved
+        return False
 
     def _post_key(keycode, is_down, flags=0):
         event = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
         Quartz.CGEventSetFlags(event, flags)
-        if target_pid:
-            Quartz.CGEventPostToPid(int(target_pid), event)
-        else:
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
     def _send_quartz_paste():
+        # CGEventPost silently drops synthetic events when Accessibility is
+        # not granted, so treat an untrusted process as a paste failure
+        # rather than reporting a phantom success.
+        if not _accessibility_trusted():
+            log.debug("paste_at_cursor Quartz skipped (accessibility not trusted)")
+            return False
         try:
             cmd_flag = getattr(Quartz, "kCGEventFlagMaskCommand", 0x00100000)
             keycode_command = 55
@@ -513,7 +520,7 @@ def paste_at_cursor(text, restore_clipboard=True, prefer_applescript=False, targ
             _post_key(keycode_v, False, cmd_flag)
             _post_key(keycode_command, False)
             log.debug(
-                "paste_at_cursor sent synthetic Cmd+V target_pid=%s"
+                "paste_at_cursor sent synthetic Cmd+V via session event tap target_pid_hint=%s"
                 % (target_pid if target_pid else "(session)")
             )
             return True
@@ -547,17 +554,11 @@ def paste_at_cursor(text, restore_clipboard=True, prefer_applescript=False, targ
         if not pasted:
             pasted = _send_applescript_paste()
 
-    if restore_clipboard and pasted:
-        _schedule_clipboard_restore(
-            saved,
-            delay=0.75,
-            label="paste_at_cursor clipboard restore",
-        )
-    elif restore_clipboard:
-        log.debug("paste_at_cursor paste failed; leaving transcript in clipboard as fallback")
+    if pasted:
+        log.debug("paste_at_cursor paste succeeded; leaving transcript in clipboard")
     else:
-        log.debug("paste_at_cursor leaving transcript in clipboard")
-    return pasted, saved
+        log.debug("paste_at_cursor paste failed; leaving transcript in clipboard as fallback")
+    return pasted
 
 
 def insert_text_at_cursor(text, target_pid=None):
@@ -667,6 +668,8 @@ class FreeWhisperApp(rumps.App):
         self._lock = threading.Lock()
         self._cooldown = 0.0
         self._record_started_at = 0.0
+        self._session_id = 0
+        self._processing_session_id = None
         self._stop_requested = False
         self._cancel_requested = False
         self._target_app_pid = None
@@ -684,6 +687,9 @@ class FreeWhisperApp(rumps.App):
         self._key_state_timer = None
         self._global_key_monitor = None
         self._settings_timer = None
+        self._hotkey_permission_prompted = False
+        self._key_poll_thread = None
+        self._key_poll_stop = threading.Event()
         self._carbon_handler_ref = None
         self._carbon_handler_proc = None
         self._carbon_hotkey_refs = {}
@@ -712,7 +718,7 @@ class FreeWhisperApp(rumps.App):
     # ── Hotkey listener (Quartz CGEvent tap) ────────────────
 
     def _start_listener(self):
-        global _app_ref, _target_keycode, _target_flag, _required_mod_flags
+        global _app_ref, _target_keycode, _target_keycodes, _target_flag, _required_mod_flags
         global _hold_to_record, _hotkey_pressed
         global _cancel_keycode, _cancel_mod_flags, _hotkey_events_suppressed
 
@@ -729,12 +735,17 @@ class FreeWhisperApp(rumps.App):
 
         if key_info:
             _target_keycode, _target_flag = key_info
+            _target_keycodes = (_target_keycode,)
         elif reg_keycode is not None:
             _target_keycode = reg_keycode
+            _target_keycodes = tuple(
+                dict.fromkeys(REGULAR_KEY_ALIASES.get(hotkey_name, (reg_keycode,)))
+            )
             _target_flag = 0
         elif hotkey_name.isdigit():
             # Raw keycode from settings key capture
             _target_keycode = int(hotkey_name)
+            _target_keycodes = (_target_keycode,)
             from settings_window import MODIFIER_FLAG_MAP
             _target_flag = MODIFIER_FLAG_MAP.get(_target_keycode, 0)
         else:
@@ -758,10 +769,28 @@ class FreeWhisperApp(rumps.App):
         self._stop_quartz_listener()
         self._stop_carbon_hotkeys()
         self._stop_global_listener_fallback()
+        self._stop_regular_hotkey_polling()
 
-        if self._start_carbon_hotkeys(hotkey_name):
-            return
+        if _hotkey_events_suppressed:
+            if self._start_quartz_listener(hotkey_name, mask, tap_option):
+                self._start_regular_hotkey_polling()
+                return
+            AppHelper.callAfter(self._request_hotkey_permissions)
+            if self._start_carbon_hotkeys(hotkey_name):
+                self._start_global_listener_fallback()
+                self._start_regular_hotkey_polling()
+                return
+        else:
+            if self._start_carbon_hotkeys(hotkey_name):
+                return
+            if self._start_quartz_listener(hotkey_name, mask, tap_option):
+                return
 
+        log.error("Cannot create hotkey listener")
+        self._start_global_listener_fallback()
+        self._start_regular_hotkey_polling()
+
+    def _start_quartz_listener(self, hotkey_name, mask, tap_option):
         self._tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
@@ -779,22 +808,69 @@ class FreeWhisperApp(rumps.App):
             )
             Quartz.CGEventTapEnable(self._tap, True)
             log.info(
-                "Event tap active — hotkey: %s (keycode=%s, suppress=%s)"
-                % (hotkey_name, _target_keycode, _hotkey_events_suppressed)
+                "Event tap active — hotkey: %s (keycodes=%s, suppress=%s)"
+                % (hotkey_name, _target_keycodes, _hotkey_events_suppressed)
             )
 
             # Re-enable tap if macOS disables it (happens after inactivity)
             self._tap_timer = rumps.Timer(self._check_tap, 5)
             self._tap_timer.start()
-            if _hold_to_record and not _target_flag and not _hotkey_events_suppressed:
-                self._key_state_timer = rumps.Timer(self._sync_regular_hotkey_state, 0.03)
-                self._key_state_timer.start()
-            return
+            return True
 
         self._tap = None
         self._tap_source = None
-        log.error("Cannot create event tap — hotkey listener unavailable")
-        self._start_global_listener_fallback()
+        log.debug("Cannot create Quartz event tap")
+        return False
+
+    def _start_regular_hotkey_polling(self):
+        if _target_flag or _required_mod_flags:
+            return
+        if self._key_poll_thread is not None and self._key_poll_thread.is_alive():
+            return
+        self._key_poll_stop.clear()
+        self._key_poll_thread = threading.Thread(
+            target=self._regular_hotkey_poll_loop,
+            daemon=True,
+        )
+        self._key_poll_thread.start()
+        log.info(
+            "Regular key polling fallback active — keycodes=%s"
+            % (_target_keycodes,)
+        )
+
+    def _stop_regular_hotkey_polling(self):
+        self._key_poll_stop.set()
+        self._key_poll_thread = None
+
+    def _regular_hotkey_poll_loop(self):
+        last_active = False
+        while not self._key_poll_stop.wait(0.01):
+            active = _regular_hotkey_is_pressed()
+            if active == last_active:
+                continue
+            last_active = active
+            AppHelper.callAfter(
+                self._handle_polled_regular_hotkey_main_thread,
+                active,
+            )
+
+    def _request_hotkey_permissions(self):
+        if self._hotkey_permission_prompted:
+            return
+        self._hotkey_permission_prompted = True
+        try:
+            trusted = AS.AXIsProcessTrustedWithOptions({
+                AS.kAXTrustedCheckOptionPrompt: True
+            })
+            log.debug(f"Accessibility trust prompt requested trusted={trusted}")
+        except Exception as e:
+            log.debug(f"Accessibility trust prompt FAILED: {e}")
+        if self.cfg.get("show_notifications"):
+            rumps.notification(
+                "FreeWhisper",
+                "Hotkey permission needed",
+                "Enable Accessibility and Input Monitoring for FreeWhisper.",
+            )
 
     def _check_tap(self, _):
         if not self._tap:
@@ -810,6 +886,7 @@ class FreeWhisperApp(rumps.App):
         if self._key_state_timer is not None:
             self._key_state_timer.stop()
             self._key_state_timer = None
+        self._stop_regular_hotkey_polling()
         if self._tap_source is not None:
             try:
                 Quartz.CFRunLoopRemoveSource(
@@ -895,8 +972,8 @@ class FreeWhisperApp(rumps.App):
                 )
 
         log.info(
-            "Carbon hotkey active — hotkey: %s (keycode=%s, mods=0x%08x)"
-            % (hotkey_name, _target_keycode, main_mods)
+            "Carbon hotkey active — hotkey: %s (keycodes=%s, mods=0x%08x)"
+            % (hotkey_name, _target_keycodes, main_mods)
         )
         return True
 
@@ -927,7 +1004,7 @@ class FreeWhisperApp(rumps.App):
         global _hotkey_pressed
 
         if hotkey_id == _HOTKEY_ID_CANCEL:
-            if is_pressed and self.is_recording:
+            if is_pressed and self._can_cancel_current_operation():
                 log.debug("CARBON global cancel -> CANCEL")
                 AppHelper.callAfter(self._do_cancel)
             return
@@ -1000,16 +1077,35 @@ class FreeWhisperApp(rumps.App):
         AppHelper.callAfter(self._handle_nsevent_hotkey_main_thread, kind, keycode, flags)
 
     def _sync_regular_hotkey_state(self, _):
+        self._handle_polled_regular_hotkey_main_thread(_regular_hotkey_is_pressed())
+
+    def _handle_polled_regular_hotkey_main_thread(self, active):
         global _hotkey_pressed
 
-        if not _hold_to_record or _target_flag or not _hotkey_pressed:
-            return
-        if _is_keycode_pressed(_target_keycode):
+        if _target_flag or _required_mod_flags:
             return
 
-        _hotkey_pressed = False
-        log.debug(f"TIMER HOTKEY UP keycode={_target_keycode} (state poll)")
-        self._on_hotkey_up()
+        if _hold_to_record:
+            if active and not _hotkey_pressed:
+                _hotkey_pressed = True
+                log.debug(f"POLL HOTKEY DOWN keycodes={_target_keycodes}")
+                self._on_hotkey_down()
+            elif not active and _hotkey_pressed:
+                _hotkey_pressed = False
+                log.debug(f"POLL HOTKEY UP keycodes={_target_keycodes}")
+                self._on_hotkey_up()
+            return
+
+        if active and not _hotkey_pressed:
+            _hotkey_pressed = True
+            log.debug(f"POLL TOGGLE keycodes={_target_keycodes}")
+            _toggle_hotkey_action(
+                "POLL",
+                _target_keycode,
+                _required_mod_flags | MODIFIER_KEYCODE_FLAGS.get(_target_keycode, 0),
+            )
+        elif not active and _hotkey_pressed:
+            _hotkey_pressed = False
 
     def _on_hotkey_down(self):
         self._do_start()
@@ -1125,6 +1221,44 @@ class FreeWhisperApp(rumps.App):
 
     # ── Recording lifecycle ─────────────────────────────────
 
+    def _session_is_active(self, session_id):
+        with self._lock:
+            return (
+                session_id == self._session_id
+                and (
+                    self.is_recording
+                    or self._processing_session_id == session_id
+                )
+            )
+
+    def _session_can_deliver(self, session_id):
+        with self._lock:
+            return (
+                session_id == self._session_id
+                and self._processing_session_id == session_id
+                and not self._cancel_requested
+            )
+
+    def _can_cancel_current_operation(self):
+        with self._lock:
+            return (
+                self.is_recording
+                or self._processing_session_id is not None
+                or bool(self.ws_connected)
+            )
+
+    def _finish_session(self, session_id, label):
+        with self._lock:
+            if session_id != self._session_id:
+                log.debug(f"{label} finish ignored stale session={session_id} current={self._session_id}")
+                return False
+            if self._processing_session_id == session_id:
+                self._processing_session_id = None
+            self._stop_requested = False
+            self._cancel_requested = False
+        self._cooldown = time.time()
+        return True
+
     def _capture_target_selection(self, element, label):
         self._target_selection_location = None
         self._target_selection_length = 0
@@ -1161,8 +1295,15 @@ class FreeWhisperApp(rumps.App):
             if self.is_recording:
                 log.debug("_do_start BLOCKED already recording")
                 return
+            if self._processing_session_id is not None:
+                log.debug(
+                    f"_do_start BLOCKED processing session={self._processing_session_id}"
+                )
+                return
+            self._session_id += 1
+            session_id = self._session_id
             self.is_recording = True
-        log.debug("_do_start OK -> recording")
+        log.debug(f"_do_start OK -> recording session={session_id}")
 
         self._audio_buffer = []
         self._texts = []
@@ -1219,18 +1360,25 @@ class FreeWhisperApp(rumps.App):
                 and _hotkey_text_artifacts_possible(self.cfg)):
             AppHelper.callLater(0.04, self._remove_toggle_start_hotkey_artifact)
 
-        threading.Thread(target=self._worker_record, daemon=True).start()
+        threading.Thread(target=self._worker_record, args=(session_id,), daemon=True).start()
 
     def _do_cancel(self):
-        """Cancel recording without transcribing."""
+        """Cancel recording or processing without transcribing."""
         with self._lock:
-            # Cancel if recording OR waiting for websocket
-            if not self.is_recording and not getattr(self, 'ws_connected', False):
+            if (
+                not self.is_recording
+                and self._processing_session_id is None
+                and not getattr(self, 'ws_connected', False)
+            ):
+                log.debug("_do_cancel BLOCKED no active operation")
                 return
+            session_id = self._session_id
             self.is_recording = False
+            self._processing_session_id = None
             self._cancel_requested = True
             self._stop_requested = True
-        log.debug("_do_cancel -> discarding")
+            self._session_id += 1
+        log.debug(f"_do_cancel -> discarding session={session_id}")
         
         # Audio confirmation for cancel as requested by user
         play_sound("stop")
@@ -1238,8 +1386,10 @@ class FreeWhisperApp(rumps.App):
         self._overlay.hide()
         self._overlay.set_state("recording")
         AppHelper.callAfter(self._finish_without_insertion_main_thread)
-        self._texts = [] # clear buffer
-        if hasattr(self, 'ws_done'): self.ws_done.set()
+        self._texts = []
+        self._audio_buffer = []
+        if hasattr(self, 'ws_done'):
+            self.ws_done.set()
         self._cleanup()
 
     def _do_stop(self):
@@ -1248,19 +1398,21 @@ class FreeWhisperApp(rumps.App):
             if not self.is_recording:
                 log.debug("_do_stop BLOCKED not recording")
                 return
+            session_id = self._session_id
             self.is_recording = False
+            self._processing_session_id = session_id
             held_for = time.time() - self._record_started_at
             self._stop_requested = True
             if held_for < _MIN_HOLD_TO_TRANSCRIBE:
                 self._cancel_requested = True
                 quick_tap = True
         if quick_tap:
-            log.debug(f"_do_stop QUICK TAP ({held_for:.3f}s) -> cancel")
+            log.debug(f"_do_stop QUICK TAP ({held_for:.3f}s) -> cancel session={session_id}")
             AppHelper.callAfter(self._finish_without_insertion_main_thread)
             self._texts = []
             self._cleanup()
             return
-        log.debug("_do_stop OK -> stopping")
+        log.debug(f"_do_stop OK -> stopping session={session_id}")
 
         play_sound("stop")
         
@@ -1270,7 +1422,7 @@ class FreeWhisperApp(rumps.App):
                 and _hotkey_text_artifacts_possible(self.cfg)):
             AppHelper.callLater(0.04, self._remove_toggle_stop_hotkey_artifact)
 
-        threading.Thread(target=self._worker_finalize, daemon=True).start()
+        threading.Thread(target=self._worker_finalize, args=(session_id,), daemon=True).start()
 
     def _restore_target_app_focus(self):
         if not self._target_app_pid:
@@ -1667,7 +1819,13 @@ class FreeWhisperApp(rumps.App):
             log.debug(f"_insert_text_via_accessibility FAILED: {e}")
             return False
 
-    def _deliver_result_main_thread(self, final):
+    def _deliver_result_main_thread(self, final, session_id):
+        if not self._session_can_deliver(session_id):
+            log.debug(
+                f"_deliver_result_main_thread skipped stale/cancelled session={session_id}"
+            )
+            return
+
         self._restore_target_app_focus()
         if self._target_ax_element is None:
             self._refresh_target_context("_deliver_result_main_thread")
@@ -1682,30 +1840,22 @@ class FreeWhisperApp(rumps.App):
 
         inserted = False
         copied_only = False
-        clipboard_backup = None
         target_capability = self._target_text_input_capability()
         if target_capability == "none":
-            inserted, clipboard_backup = paste_at_cursor(
+            inserted = paste_at_cursor(
                 final,
-                restore_clipboard=True,
                 prefer_applescript=False,
                 target_pid=self._target_app_pid,
             )
             if inserted:
-                log.debug("_deliver_result_main_thread used pid-targeted keyboard paste fallback")
+                log.debug("_deliver_result_main_thread used session keyboard paste fallback")
             else:
                 inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
                 if inserted:
-                    _schedule_clipboard_restore(
-                        clipboard_backup,
-                        delay=0.0,
-                        label="_deliver_result_main_thread clipboard restore after unicode fallback",
-                    )
                     log.debug("_deliver_result_main_thread used direct unicode typing fallback")
         else:
-            inserted, clipboard_backup = paste_at_cursor(
+            inserted = paste_at_cursor(
                 final,
-                restore_clipboard=True,
                 prefer_applescript=False,
                 target_pid=self._target_app_pid,
             )
@@ -1717,26 +1867,23 @@ class FreeWhisperApp(rumps.App):
             if not inserted:
                 inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
             if inserted:
-                _schedule_clipboard_restore(
-                    clipboard_backup,
-                    delay=0.0,
-                    label="_deliver_result_main_thread clipboard restore after strong fallback",
-                )
+                log.debug("_deliver_result_main_thread used strong text fallback")
         elif not inserted and target_capability == "weak":
             log.debug(
                 "_deliver_result_main_thread weak text target -> AX insert fallback"
             )
             inserted = self._insert_text_via_accessibility(final)
             if inserted:
-                _schedule_clipboard_restore(
-                    clipboard_backup,
-                    delay=0.0,
-                    label="_deliver_result_main_thread clipboard restore after weak fallback",
-                )
+                log.debug("_deliver_result_main_thread used weak text fallback")
         elif not inserted:
             log.debug("_deliver_result_main_thread no text target -> clipboard only")
 
-        if not inserted:
+        if inserted:
+            if copy_text_to_clipboard(final):
+                log.debug("_deliver_result_main_thread ensured transcript remains in clipboard")
+            else:
+                log.debug("_deliver_result_main_thread could not refresh transcript clipboard after insertion")
+        else:
             copied_only = copy_text_to_clipboard(final)
             if copied_only:
                 log.debug("_deliver_result_main_thread kept transcript in clipboard")
@@ -1746,27 +1893,37 @@ class FreeWhisperApp(rumps.App):
             title = "\u2713 Copied to clipboard" if copied_only else "\u2713 Transcribed"
             rumps.notification("FreeWhisper", title, preview)
 
-    def _finish_without_insertion_main_thread(self):
+        self._finish_session(session_id, "_deliver_result_main_thread")
+
+    def _finish_without_insertion_main_thread(self, session_id=None):
+        if session_id is not None and not self._session_can_deliver(session_id):
+            log.debug(
+                f"_finish_without_insertion_main_thread skipped stale/cancelled session={session_id}"
+            )
+            return
+
         self._restore_target_app_focus()
         if self._should_skip_dead_key_neutralizer():
             log.debug("_finish_without_insertion_main_thread skipped dead-key neutralizer")
         else:
             self._clear_dead_key_state()
+        if session_id is not None:
+            self._finish_session(session_id, "_finish_without_insertion_main_thread")
 
     # ── Background workers ──────────────────────────────────
 
-    def _worker_record(self):
+    def _worker_record(self, session_id):
         cfg = self.cfg
         provider = cfg.get("provider", "gladia")
 
         api_key = cfg["api_key"] if provider == "gladia" else cfg.get("cohere_api_key", "")
         if not api_key:
             log.debug(f"WORKER no api_key for {provider}")
-            self._cleanup()
+            self._cleanup(session_id)
             return
 
-        if self._cancel_requested:
-            log.debug("WORKER cancelled before provider setup")
+        if not self._session_is_active(session_id) or self._cancel_requested:
+            log.debug(f"WORKER cancelled before provider setup session={session_id}")
             return
 
         # Mic already started in _do_start()
@@ -1780,8 +1937,8 @@ class FreeWhisperApp(rumps.App):
         # local audio immediately, so waiting here doesn't lose speech.
         grace_deadline = self._record_started_at + _REMOTE_SESSION_GRACE
         while time.time() < grace_deadline:
-            if self._cancel_requested:
-                log.debug("WORKER cancelled before Gladia session creation")
+            if not self._session_is_active(session_id) or self._cancel_requested:
+                log.debug(f"WORKER cancelled before Gladia session creation session={session_id}")
                 return
             time.sleep(0.01)
 
@@ -1819,57 +1976,69 @@ class FreeWhisperApp(rumps.App):
             resp.raise_for_status()
             ws_url = resp.json()["url"]
             log.debug(f"WORKER gladia session OK url={ws_url[:60]}...")
-            if self._cancel_requested:
-                log.debug("WORKER cancelled after Gladia session creation — closing session")
+            if not self._session_is_active(session_id) or self._cancel_requested:
+                log.debug(f"WORKER cancelled after Gladia session creation session={session_id}")
+                return
         except Exception as e:
             log.debug(f"WORKER gladia API FAILED: {e}")
-            self._cleanup()
+            self._cleanup(session_id)
             return
 
         # 3) Connect WebSocket
+        ws = None
         try:
-            self.ws = ws_lib.WebSocket(
+            ws = ws_lib.WebSocket(
                 sslopt={"ca_certs": certifi.where(), "cert_reqs": ssl.CERT_REQUIRED}
             )
-            self.ws.settimeout(30)
-            self.ws.connect(ws_url)
+            ws.settimeout(30)
+            ws.connect(ws_url)
             log.debug("WORKER websocket connected")
-            if self._cancel_requested:
-                log.debug("WORKER cancelled after websocket connect — sending stop_recording")
+            if not self._session_is_active(session_id) or self._cancel_requested:
+                log.debug(f"WORKER cancelled after websocket connect session={session_id}")
                 try:
-                    self.ws.send(json.dumps({"type": "stop_recording"}))
+                    ws.send(json.dumps({"type": "stop_recording"}))
                 except Exception:
                     pass
                 try:
-                    self.ws.close()
+                    ws.close()
                 except Exception:
                     pass
-                self.ws = None
-                self.ws_connected = False
-                self.ws_done.set()
                 return
+            self.ws = ws
         except Exception as e:
             log.debug(f"WORKER websocket FAILED: {e}")
-            self._cleanup()
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            self._cleanup(session_id)
             return
 
         # 4) Start WS reader thread
-        threading.Thread(target=self._ws_reader, daemon=True).start()
+        threading.Thread(target=self._ws_reader, args=(session_id, ws), daemon=True).start()
 
         # 5) Flush buffered audio then stream live
+        if not self._session_is_active(session_id):
+            log.debug(f"WORKER stream setup skipped stale session={session_id}")
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
         self.ws_connected = True
         n = len(self._audio_buffer)
         for chunk in self._audio_buffer:
             try:
-                self.ws.send(chunk, opcode=ws_lib.ABNF.OPCODE_BINARY)
+                ws.send(chunk, opcode=ws_lib.ABNF.OPCODE_BINARY)
             except Exception:
                 break
         self._audio_buffer.clear()
         log.debug(f"WORKER streaming live (flushed {n} buffered chunks)")
-        if self._stop_requested and self.ws:
+        if self._stop_requested and ws:
             log.debug("WORKER stop was already requested — sending stop_recording now")
             try:
-                self.ws.send(json.dumps({"type": "stop_recording"}))
+                ws.send(json.dumps({"type": "stop_recording"}))
             except Exception:
                 pass
 
@@ -1884,10 +2053,10 @@ class FreeWhisperApp(rumps.App):
         elif self.is_recording:
             self._audio_buffer.append(raw)
 
-    def _ws_reader(self):
+    def _ws_reader(self, session_id, ws):
         while True:
             try:
-                msg = self.ws.recv()
+                msg = ws.recv()
                 if not msg:
                     log.debug("WORKER ws recv empty — closing")
                     break
@@ -1898,14 +2067,19 @@ class FreeWhisperApp(rumps.App):
                     text = td.get("utterance", {}).get("text", "").strip()
                     is_final = td.get("is_final")
                     log.debug(f"WORKER transcript is_final={is_final} text={text[:80] if text else '(empty)'}")
-                    if is_final and text:
+                    if is_final and text and self._session_is_active(session_id):
                         self._texts.append(text)
             except Exception as e:
                 log.debug(f"WORKER ws recv exception: {e}")
                 break
-        self.ws_done.set()
+        if self._session_is_active(session_id):
+            self.ws_done.set()
 
-    def _worker_finalize(self):
+    def _worker_finalize(self, session_id):
+        if not self._session_is_active(session_id):
+            log.debug(f"WORKER finalize skipped stale session={session_id}")
+            return
+
         # Stop mic
         if self.audio_stream:
             try:
@@ -1917,11 +2091,15 @@ class FreeWhisperApp(rumps.App):
 
         provider = self.cfg.get("provider", "gladia")
         if provider == "cohere":
-            self._finalize_cohere()
+            self._finalize_cohere(session_id)
         else:
-            self._finalize_gladia()
+            self._finalize_gladia(session_id)
 
-    def _finalize_gladia(self):
+    def _finalize_gladia(self, session_id):
+        if not self._session_is_active(session_id):
+            log.debug(f"WORKER gladia finalize skipped stale session={session_id}")
+            return
+
         # Signal end of recording to Gladia
         if self.ws:
             try:
@@ -1931,6 +2109,9 @@ class FreeWhisperApp(rumps.App):
 
         # Wait for all final transcripts (max 15s)
         self.ws_done.wait(timeout=15)
+        if not self._session_can_deliver(session_id):
+            log.debug(f"WORKER gladia final skipped stale/cancelled session={session_id}")
+            return
 
         if self.ws:
             try:
@@ -1942,15 +2123,15 @@ class FreeWhisperApp(rumps.App):
 
         final = " ".join(self._texts).strip()
         log.debug(f"WORKER gladia final: '{final[:100] if final else '(empty)'}' ({len(self._texts)} segments)")
-        self._paste_result(final)
+        self._paste_result(final, session_id)
 
-    def _finalize_cohere(self):
+    def _finalize_cohere(self, session_id):
         cfg = self.cfg
         audio_data = b"".join(self._audio_buffer)
 
         if not audio_data:
             log.debug("COHERE no audio data")
-            self._paste_result("")
+            self._paste_result("", session_id)
             return
 
         # Create WAV in memory
@@ -1988,39 +2169,55 @@ class FreeWhisperApp(rumps.App):
             log.debug(f"COHERE API FAILED: {e}")
             final = ""
 
-        self._paste_result(final)
+        self._paste_result(final, session_id)
 
-    def _paste_result(self, final):
+    def _paste_result(self, final, session_id):
+        if not self._session_can_deliver(session_id):
+            log.debug(f"_paste_result skipped stale/cancelled session={session_id}")
+            return
         self._overlay.hide()
         self._overlay.set_state("recording")
 
         if final:
-            AppHelper.callAfter(self._deliver_result_main_thread, final)
+            AppHelper.callAfter(self._deliver_result_main_thread, final, session_id)
         else:
-            AppHelper.callAfter(self._finish_without_insertion_main_thread)
+            AppHelper.callAfter(self._finish_without_insertion_main_thread, session_id)
             if self.cfg.get("show_notifications"):
                 rumps.notification("FreeWhisper", "", "No speech detected")
 
         self._cooldown = time.time()
 
-    def _cleanup(self):
-        log.debug("_cleanup called")
-        self.is_recording = False
-        self.ws_connected = False
-        self._overlay.hide()
-        if self.audio_stream:
-            try:
-                self.audio_stream.stop()
-                self.audio_stream.close()
-            except Exception:
-                pass
+    def _cleanup(self, session_id=None):
+        log.debug(
+            "_cleanup called session=%s"
+            % (session_id if session_id is not None else "(force)")
+        )
+        with self._lock:
+            if session_id is not None and session_id != self._session_id:
+                log.debug(
+                    f"_cleanup ignored stale session={session_id} current={self._session_id}"
+                )
+                return
+            self.is_recording = False
+            self.ws_connected = False
+            if session_id is None or self._processing_session_id == session_id:
+                self._processing_session_id = None
+            audio_stream = self.audio_stream
+            ws = self.ws
             self.audio_stream = None
-        if self.ws:
+            self.ws = None
+        self._overlay.hide()
+        if audio_stream:
             try:
-                self.ws.close()
+                audio_stream.stop()
+                audio_stream.close()
             except Exception:
                 pass
-            self.ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
         self.title = None
         self._cooldown = time.time()
 

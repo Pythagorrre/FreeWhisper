@@ -176,6 +176,7 @@ def sign_runtime(bundle_path: Path) -> None:
     python_framework = bundle_path / "Contents" / "Frameworks" / "Python.framework"
     version_root = python_framework / "Versions" / PYTHON_VERSION
     python_app = version_root / "Resources" / "Python.app"
+    python_binary = python_app / "Contents" / "MacOS" / "Python"
     nested_bundles = (
         version_root / "Frameworks" / "Tcl.framework",
         version_root / "Frameworks" / "Tk.framework",
@@ -192,7 +193,23 @@ def sign_runtime(bundle_path: Path) -> None:
 
     for nested_bundle in nested_bundles[:2]:
         run(["codesign", "--force", "--deep", "--sign", "-", str(nested_bundle)])
-    run(["codesign", "--force", "--deep", "--sign", "-", str(python_app)])
+
+    # The embedded Python interpreter is re-signed under the outer bundle
+    # identifier so TCC (Microphone, Accessibility, Input Monitoring)
+    # attributes permission requests to com.freewhisper.app instead of
+    # org.python.python. Without this, the Python child process has a
+    # distinct TCC identity from the launcher and macOS re-prompts on every
+    # launch even though permissions were granted to FreeWhisper.
+    run([
+        "codesign", "--force", "--sign", "-",
+        "--identifier", BUNDLE_ID,
+        str(python_binary),
+    ])
+    run([
+        "codesign", "--force", "--deep", "--sign", "-",
+        "--identifier", BUNDLE_ID,
+        str(python_app),
+    ])
     run(["codesign", "--force", "--deep", "--sign", "-", str(python_framework)])
     run(["codesign", "--force", "--deep", "--sign", "-", str(bundle_path)])
 
