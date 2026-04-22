@@ -89,6 +89,31 @@ def write_info_plist(path: Path) -> None:
         plistlib.dump(info, f)
 
 
+def rewrite_python_app_info_plist(python_app: Path) -> None:
+    info_path = python_app / "Contents" / "Info.plist"
+    with info_path.open("rb") as f:
+        info = plistlib.load(f)
+
+    info.update(
+        {
+            "CFBundleDisplayName": APP_NAME,
+            "CFBundleIdentifier": BUNDLE_ID,
+            "CFBundleName": APP_NAME,
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
+            "LSUIElement": True,
+            "NSAppleEventsUsageDescription": (
+                "FreeWhisper needs to paste transcribed text into your active application."
+            ),
+            "NSMicrophoneUsageDescription": (
+                "FreeWhisper needs microphone access for speech-to-text dictation."
+            ),
+        }
+    )
+    with info_path.open("wb") as f:
+        plistlib.dump(info, f)
+
+
 def ensure_python_runtime() -> None:
     if not PYTHON_HOME_SRC.exists():
         raise FileNotFoundError(f"Python home not found: {PYTHON_HOME_SRC}")
@@ -198,8 +223,8 @@ def sign_runtime(bundle_path: Path) -> None:
     # identifier so TCC (Microphone, Accessibility, Input Monitoring)
     # attributes permission requests to com.freewhisper.app instead of
     # org.python.python. Without this, the Python child process has a
-    # distinct TCC identity from the launcher and macOS re-prompts on every
-    # launch even though permissions were granted to FreeWhisper.
+    # distinct TCC identity from the launcher and macOS re-prompts even
+    # though permissions were granted to FreeWhisper.
     run([
         "codesign", "--force", "--sign", "-",
         "--identifier", BUNDLE_ID,
@@ -261,6 +286,9 @@ def copy_python_runtime(bundle_path: Path) -> None:
     remove_path(site_packages_dst)
     shutil.copytree(SITE_PACKAGES_SRC, site_packages_dst, symlinks=True)
     prune_python_runtime(framework_version_dst)
+    rewrite_python_app_info_plist(
+        framework_version_dst / "Resources" / "Python.app"
+    )
 
     rewrite_macho_paths(bundle_path)
 

@@ -148,6 +148,7 @@ _hotkey_events_suppressed = False
 _HOTKEY_FLAG_MASK = 0x009E0000
 _MIN_HOLD_TO_TRANSCRIBE = 0.25
 _REMOTE_SESSION_GRACE = 0.25
+_AUDIO_RESET_SETTLE_SECONDS = 0.18
 _TEXT_INPUT_ROLES = {
     "AXComboBox",
     "AXSearchField",
@@ -459,6 +460,20 @@ rumps_runtime.NSApp = FreeWhisperNSApp
 
 
 def _global_tap_callback(proxy, event_type, event, refcon):
+    disabled_events = (
+        getattr(Quartz, "kCGEventTapDisabledByTimeout", None),
+        getattr(Quartz, "kCGEventTapDisabledByUserInput", None),
+    )
+    if event_type in disabled_events:
+        log.debug(f"TAP disabled event received type={event_type}")
+        if _app_ref:
+            AppHelper.callAfter(_app_ref._reenable_quartz_tap, "callback")
+        return event
+
+    if event is None:
+        log.debug(f"TAP callback received no event type={event_type}")
+        return event
+
     keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
     flags = Quartz.CGEventGetFlags(event)
 
@@ -507,6 +522,8 @@ def paste_at_cursor(text, prefer_applescript=False, target_pid=None):
         # not granted, so treat an untrusted process as a paste failure
         # rather than reporting a phantom success.
         if not _accessibility_trusted():
+            if _app_ref is not None:
+                AppHelper.callAfter(_app_ref._request_accessibility_permissions, "paste")
             log.debug("paste_at_cursor Quartz skipped (accessibility not trusted)")
             return False
         try:
@@ -688,11 +705,14 @@ class FreeWhisperApp(rumps.App):
         self._global_key_monitor = None
         self._settings_timer = None
         self._hotkey_permission_prompted = False
+        self._accessibility_permission_prompted = False
+        self._audio_reset_lock = threading.Lock()
         self._key_poll_thread = None
         self._key_poll_stop = threading.Event()
         self._carbon_handler_ref = None
         self._carbon_handler_proc = None
         self._carbon_hotkey_refs = {}
+        self._activity_token = self._begin_hotkey_activity()
         self._control_bridge = _AppControlBridge.alloc().init()
         self._control_bridge.app_ref = self
         AppKit.NSDistributedNotificationCenter.defaultCenter().addObserver_selector_name_object_(
@@ -711,6 +731,7 @@ class FreeWhisperApp(rumps.App):
 
         self._start_listener()
         AppHelper.callAfter(self._apply_menu_bar_icon_visibility)
+        AppHelper.callLater(0.5, self._request_accessibility_permissions, "startup")
 
         if self.cfg.get("auto_update", False):
             threading.Thread(target=self._auto_update_on_launch, daemon=True).start()
@@ -757,10 +778,11 @@ class FreeWhisperApp(rumps.App):
         mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
                 | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
                 | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp))
-        _hotkey_events_suppressed = not _target_flag
+        should_suppress_hotkey = not _target_flag
+        _hotkey_events_suppressed = False
         tap_option = (
             Quartz.kCGEventTapOptionDefault
-            if _hotkey_events_suppressed
+            if should_suppress_hotkey
             else Quartz.kCGEventTapOptionListenOnly
         )
 
@@ -771,15 +793,18 @@ class FreeWhisperApp(rumps.App):
         self._stop_global_listener_fallback()
         self._stop_regular_hotkey_polling()
 
-        if _hotkey_events_suppressed:
+        if should_suppress_hotkey:
+            if self._start_carbon_hotkeys(hotkey_name):
+                self._start_regular_hotkey_polling()
+                return
+
+            _hotkey_events_suppressed = True
             if self._start_quartz_listener(hotkey_name, mask, tap_option):
                 self._start_regular_hotkey_polling()
                 return
+
+            _hotkey_events_suppressed = False
             AppHelper.callAfter(self._request_hotkey_permissions)
-            if self._start_carbon_hotkeys(hotkey_name):
-                self._start_global_listener_fallback()
-                self._start_regular_hotkey_polling()
-                return
         else:
             if self._start_carbon_hotkeys(hotkey_name):
                 return
@@ -858,26 +883,49 @@ class FreeWhisperApp(rumps.App):
         if self._hotkey_permission_prompted:
             return
         self._hotkey_permission_prompted = True
+        self._request_accessibility_permissions("hotkey")
+
+    def _request_accessibility_permissions(self, reason):
+        if _accessibility_trusted():
+            log.debug(f"Accessibility already trusted reason={reason}")
+            return True
+        if self._accessibility_permission_prompted:
+            log.debug(f"Accessibility prompt skipped reason={reason} (already prompted)")
+            return False
+        self._accessibility_permission_prompted = True
         try:
             trusted = AS.AXIsProcessTrustedWithOptions({
                 AS.kAXTrustedCheckOptionPrompt: True
             })
-            log.debug(f"Accessibility trust prompt requested trusted={trusted}")
+            log.debug(
+                f"Accessibility trust prompt requested reason={reason} trusted={trusted}"
+            )
         except Exception as e:
             log.debug(f"Accessibility trust prompt FAILED: {e}")
+            trusted = False
         if self.cfg.get("show_notifications"):
             rumps.notification(
                 "FreeWhisper",
-                "Hotkey permission needed",
-                "Enable Accessibility and Input Monitoring for FreeWhisper.",
+                "Accessibility needed",
+                "Allow FreeWhisper so it can paste transcriptions automatically.",
             )
+        return bool(trusted)
 
     def _check_tap(self, _):
         if not self._tap:
             return
         if not Quartz.CGEventTapIsEnabled(self._tap):
-            log.debug("TAP was disabled by macOS — re-enabling")
+            self._reenable_quartz_tap("timer")
+
+    def _reenable_quartz_tap(self, source):
+        if not self._tap:
+            return
+        try:
+            log.debug(f"TAP was disabled by macOS — re-enabling source={source}")
+            Quartz.CGEventTapEnable(self._tap, False)
             Quartz.CGEventTapEnable(self._tap, True)
+        except Exception as e:
+            log.debug(f"TAP re-enable FAILED source={source}: {e}")
 
     def _stop_quartz_listener(self):
         if self._tap_timer is not None:
@@ -1113,6 +1161,162 @@ class FreeWhisperApp(rumps.App):
     def _on_hotkey_up(self):
         self._do_stop()
 
+    def _begin_hotkey_activity(self):
+        try:
+            options = getattr(
+                AppKit,
+                "NSActivityUserInitiatedAllowingIdleSystemSleep",
+                None,
+            )
+            if options is None:
+                return None
+            token = AppKit.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+                options,
+                "Keep FreeWhisper hotkey and microphone startup responsive",
+            )
+            log.debug("App activity token active for hotkey responsiveness")
+            return token
+        except Exception as e:
+            log.debug(f"App activity token FAILED: {e}")
+            return None
+
+    def _configured_input_device(self):
+        input_device = self.cfg.get("input_device")
+        if input_device is None:
+            return None
+        try:
+            return int(input_device)
+        except (TypeError, ValueError):
+            log.debug(f"Invalid configured input_device={input_device!r}; using system default")
+            return None
+
+    def _audio_device_name(self, device):
+        if device is None:
+            return "System Default"
+        try:
+            info = sd.query_devices(device, "input")
+            return str(info.get("name") or device)
+        except Exception:
+            return str(device)
+
+    def _default_input_device_index(self):
+        try:
+            default_device = sd.default.device
+            if isinstance(default_device, (list, tuple)) or hasattr(default_device, "__getitem__"):
+                return int(default_device[0])
+            return int(default_device)
+        except Exception:
+            return None
+
+    def _input_device_priority(self, name):
+        lowered = name.lower()
+        if any(token in lowered for token in ("macbook", "built-in", "interne", "intégré", "integre")):
+            return 0
+        if any(token in lowered for token in ("background", "blackhole", "loopback", "teams", "zoom")):
+            return 3
+        if "airpods" in lowered:
+            return 2
+        return 1
+
+    def _audio_input_device_candidates(self, requested_device):
+        candidates = []
+        seen = set()
+
+        def add(device, label):
+            key = "__default__" if device is None else int(device)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((device, label))
+
+        if requested_device is None:
+            add(None, "system default")
+        else:
+            add(requested_device, "configured")
+            add(None, "system default")
+
+        default_index = self._default_input_device_index()
+        fallback_devices = []
+        try:
+            for index, info in enumerate(sd.query_devices()):
+                if int(info.get("max_input_channels", 0)) <= 0:
+                    continue
+                if requested_device is None and default_index == index:
+                    continue
+                name = str(info.get("name") or f"input {index}")
+                fallback_devices.append((self._input_device_priority(name), index, name))
+        except Exception as e:
+            log.debug(f"Audio device enumeration FAILED: {e}")
+
+        for _, index, name in sorted(fallback_devices):
+            add(index, f"fallback {name}")
+
+        return candidates
+
+    def _reset_audio_backend(self, reason):
+        with self._audio_reset_lock:
+            log.debug(f"Resetting PortAudio backend reason={reason}")
+            try:
+                sd._terminate()
+            except Exception as e:
+                log.debug(f"PortAudio terminate FAILED: {e}")
+            time.sleep(_AUDIO_RESET_SETTLE_SECONDS)
+            try:
+                sd._initialize()
+            except Exception as e:
+                log.debug(f"PortAudio initialize FAILED: {e}")
+            try:
+                sd.query_devices()
+            except Exception as e:
+                log.debug(f"PortAudio device refresh FAILED: {e}")
+
+    def _create_audio_stream(self, device):
+        stream = sd.InputStream(
+            device=device,
+            samplerate=self.cfg["sample_rate"],
+            channels=1,
+            dtype="int16",
+            blocksize=int(self.cfg["sample_rate"] * 0.1),
+            callback=self._audio_cb,
+        )
+        try:
+            stream.start()
+        except Exception:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            raise
+        return stream
+
+    def _open_audio_stream(self):
+        requested_device = self._configured_input_device()
+        candidates = self._audio_input_device_candidates(requested_device)
+        last_error = None
+
+        for index, (device, label) in enumerate(candidates):
+            attempts = 2 if index == 0 else 1
+            for attempt in range(1, attempts + 1):
+                if last_error is not None:
+                    self._reset_audio_backend(
+                        f"after open failure device={self._audio_device_name(device)}"
+                    )
+                try:
+                    stream = self._create_audio_stream(device)
+                    log.debug(
+                        "Audio input stream active device=%s label=%s attempt=%s"
+                        % (self._audio_device_name(device), label, attempt)
+                    )
+                    return stream
+                except Exception as e:
+                    last_error = e
+                    log.debug(
+                        "Audio input open FAILED device=%s label=%s attempt=%s: %s"
+                        % (self._audio_device_name(device), label, attempt, e)
+                    )
+
+        raise RuntimeError(f"Could not open any input device: {last_error}") from last_error
+
     def _refresh_target_context(self, label):
         try:
             front_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
@@ -1331,22 +1535,17 @@ class FreeWhisperApp(rumps.App):
 
         # Start mic FIRST so the overlay waveform reacts instantly
         try:
-            input_device = self.cfg.get("input_device")
-            if input_device is not None:
-                input_device = int(input_device)
-            self.audio_stream = sd.InputStream(
-                device=input_device,
-                samplerate=self.cfg["sample_rate"],
-                channels=1,
-                dtype="int16",
-                blocksize=int(self.cfg["sample_rate"] * 0.1),
-                callback=self._audio_cb,
-            )
-            self.audio_stream.start()
+            self.audio_stream = self._open_audio_stream()
         except Exception as e:
             log.debug(f"_do_start mic FAILED: {e}")
             with self._lock:
                 self.is_recording = False
+            if self.cfg.get("show_notifications"):
+                rumps.notification(
+                    "FreeWhisper",
+                    "Microphone unavailable",
+                    "macOS would not open an input device. Try again after reconnecting the microphone.",
+                )
             return
 
         play_sound("start")
