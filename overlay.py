@@ -1,5 +1,6 @@
 """Floating waveform overlay using WKWebView for UI."""
 
+import logging
 import math
 import numpy as np
 import os
@@ -18,6 +19,9 @@ from AppKit import (
 )
 from Foundation import NSURL, NSURLRequest, NSObject
 from PyObjCTools import AppHelper
+
+
+log = logging.getLogger("freewhisper")
 
 
 # The HTML UI size roughly maps to a wide pill
@@ -68,10 +72,18 @@ class OverlayWindow:
         self._cancel_label = str(label)
 
     def set_state(self, state_name):
+        log.debug(
+            "Overlay set_state requested state=%s visible=%s loaded=%s"
+            % (state_name, self._visible, self._page_loaded)
+        )
         AppHelper.callAfter(self._set_state_main_thread, state_name)
         
     def _set_state_main_thread(self, state_name):
         if not getattr(self, '_visible', False) or self._webview is None:
+            log.debug(
+                "Overlay set_state skipped state=%s visible=%s has_webview=%s"
+                % (state_name, self._visible, self._webview is not None)
+            )
             return
         js_code = f"if(window.setUIState) window.setUIState('{state_name}');"
         self._webview.evaluateJavaScript_completionHandler_(js_code, None)
@@ -160,14 +172,20 @@ class OverlayWindow:
             self._pending_js = js
         self._window.orderFront_(None)
         self._visible = True
+        log.debug(
+            "Overlay shown loaded=%s has_webview=%s"
+            % (self._page_loaded, self._webview is not None)
+        )
 
-    def hide(self):
-        AppHelper.callAfter(self._hide_main_thread)
+    def hide(self, reason="unspecified"):
+        log.debug("Overlay hide requested reason=%s visible=%s" % (reason, self._visible))
+        AppHelper.callAfter(self._hide_main_thread, reason)
         
-    def _hide_main_thread(self):
+    def _hide_main_thread(self, reason="unspecified"):
         self._visible = False
         if self._window:
             self._window.orderOut_(None)
+        log.debug("Overlay hidden reason=%s had_window=%s" % (reason, self._window is not None))
 
     def push_audio(self, raw_bytes):
         """Feed raw int16 audio data to JS visualizer."""

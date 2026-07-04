@@ -14,9 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "FreeWhisper"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 BUNDLE_ID = "com.freewhisper.app"
 BUNDLE_PATH = ROOT / f"{APP_NAME}.app"
+DESIGNATED_REQUIREMENT = f'designated => identifier "{BUNDLE_ID}"'
 
 PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 PYTHON_HOME_SRC = Path(sys.base_prefix)
@@ -49,6 +50,24 @@ MACHO_MAGICS = {
 
 def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
+
+
+def codesign(
+    path: Path,
+    *,
+    deep: bool = False,
+    identifier: str | None = None,
+    requirements: str | None = None,
+) -> None:
+    cmd = ["codesign", "--force", "--sign", "-"]
+    if deep:
+        cmd.append("--deep")
+    if identifier:
+        cmd.extend(["--identifier", identifier])
+    if requirements:
+        cmd.append(f"-r={requirements}")
+    cmd.append(str(path))
+    run(cmd)
 
 
 def copy_file(src: Path, dst: Path) -> None:
@@ -214,10 +233,10 @@ def sign_runtime(bundle_path: Path) -> None:
             path_str = str(path)
             if any(path_str.startswith(prefix) for prefix in nested_prefixes):
                 continue
-            run(["codesign", "--force", "--sign", "-", str(path)])
+            codesign(path)
 
     for nested_bundle in nested_bundles[:2]:
-        run(["codesign", "--force", "--deep", "--sign", "-", str(nested_bundle)])
+        codesign(nested_bundle, deep=True)
 
     # The embedded Python interpreter is re-signed under the outer bundle
     # identifier so TCC (Microphone, Accessibility, Input Monitoring)
@@ -225,18 +244,29 @@ def sign_runtime(bundle_path: Path) -> None:
     # org.python.python. Without this, the Python child process has a
     # distinct TCC identity from the launcher and macOS re-prompts even
     # though permissions were granted to FreeWhisper.
-    run([
-        "codesign", "--force", "--sign", "-",
-        "--identifier", BUNDLE_ID,
-        str(python_binary),
-    ])
-    run([
-        "codesign", "--force", "--deep", "--sign", "-",
-        "--identifier", BUNDLE_ID,
-        str(python_app),
-    ])
-    run(["codesign", "--force", "--deep", "--sign", "-", str(python_framework)])
-    run(["codesign", "--force", "--deep", "--sign", "-", str(bundle_path)])
+    codesign(
+        python_binary,
+        identifier=BUNDLE_ID,
+        requirements=DESIGNATED_REQUIREMENT,
+    )
+    codesign(
+        python_app,
+        deep=True,
+        identifier=BUNDLE_ID,
+        requirements=DESIGNATED_REQUIREMENT,
+    )
+    codesign(
+        python_framework,
+        deep=True,
+        identifier=BUNDLE_ID,
+        requirements=DESIGNATED_REQUIREMENT,
+    )
+    codesign(
+        bundle_path,
+        deep=True,
+        identifier=BUNDLE_ID,
+        requirements=DESIGNATED_REQUIREMENT,
+    )
 
 
 def prune_python_runtime(version_root: Path) -> None:

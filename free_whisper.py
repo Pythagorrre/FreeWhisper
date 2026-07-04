@@ -149,6 +149,9 @@ _HOTKEY_FLAG_MASK = 0x009E0000
 _MIN_HOLD_TO_TRANSCRIBE = 0.25
 _REMOTE_SESSION_GRACE = 0.25
 _AUDIO_RESET_SETTLE_SECONDS = 0.18
+_GLADIA_RETRY_INITIAL_SECONDS = 0.6
+_GLADIA_RETRY_MAX_SECONDS = 3.0
+_GLADIA_TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 _TEXT_INPUT_ROLES = {
     "AXComboBox",
     "AXSearchField",
@@ -515,7 +518,11 @@ def paste_at_cursor(text, prefer_applescript=False, target_pid=None):
     def _post_key(keycode, is_down, flags=0):
         event = Quartz.CGEventCreateKeyboardEvent(None, keycode, is_down)
         Quartz.CGEventSetFlags(event, flags)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        if target_pid:
+            Quartz.CGEventPostToPid(int(target_pid), event)
+            return
+        tap = getattr(Quartz, "kCGAnnotatedSessionEventTap", Quartz.kCGHIDEventTap)
+        Quartz.CGEventPost(tap, event)
 
     def _send_quartz_paste():
         # CGEventPost silently drops synthetic events when Accessibility is
@@ -531,14 +538,19 @@ def paste_at_cursor(text, prefer_applescript=False, target_pid=None):
             keycode_command = 55
             keycode_v = 9
 
-            time.sleep(0.10)
-            _post_key(keycode_command, True)
+            time.sleep(0.08)
+            _post_key(keycode_command, True, cmd_flag)
+            time.sleep(0.01)
             _post_key(keycode_v, True, cmd_flag)
             _post_key(keycode_v, False, cmd_flag)
-            _post_key(keycode_command, False)
+            time.sleep(0.01)
+            _post_key(keycode_command, False, 0)
             log.debug(
-                "paste_at_cursor sent synthetic Cmd+V via session event tap target_pid_hint=%s"
-                % (target_pid if target_pid else "(session)")
+                "paste_at_cursor sent synthetic Cmd+V route=%s target_pid=%s"
+                % (
+                    "pid" if target_pid else "session",
+                    target_pid if target_pid else "(none)",
+                )
             )
             return True
         except Exception as e:
@@ -731,7 +743,6 @@ class FreeWhisperApp(rumps.App):
 
         self._start_listener()
         AppHelper.callAfter(self._apply_menu_bar_icon_visibility)
-        AppHelper.callLater(0.5, self._request_accessibility_permissions, "startup")
 
         if self.cfg.get("auto_update", False):
             threading.Thread(target=self._auto_update_on_launch, daemon=True).start()
@@ -1582,7 +1593,7 @@ class FreeWhisperApp(rumps.App):
         # Audio confirmation for cancel as requested by user
         play_sound("stop")
         
-        self._overlay.hide()
+        self._overlay.hide("cancel")
         self._overlay.set_state("recording")
         AppHelper.callAfter(self._finish_without_insertion_main_thread)
         self._texts = []
@@ -2040,42 +2051,35 @@ class FreeWhisperApp(rumps.App):
         inserted = False
         copied_only = False
         target_capability = self._target_text_input_capability()
-        if target_capability == "none":
-            inserted = paste_at_cursor(
-                final,
-                prefer_applescript=False,
-                target_pid=self._target_app_pid,
-            )
-            if inserted:
-                log.debug("_deliver_result_main_thread used session keyboard paste fallback")
-            else:
-                inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
-                if inserted:
-                    log.debug("_deliver_result_main_thread used direct unicode typing fallback")
-        else:
-            inserted = paste_at_cursor(
-                final,
-                prefer_applescript=False,
-                target_pid=self._target_app_pid,
-            )
-            if inserted:
-                log.debug("_deliver_result_main_thread used global keyboard paste method=quartz-first")
+        prefers_keyboard_paste = self._target_prefers_keyboard_paste()
+        tried_ax_insert = False
 
-        if not inserted and target_capability == "strong":
+        if target_capability in {"strong", "weak"} and not prefers_keyboard_paste:
+            tried_ax_insert = True
             inserted = self._insert_text_via_accessibility(final)
-            if not inserted:
-                inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
             if inserted:
-                log.debug("_deliver_result_main_thread used strong text fallback")
-        elif not inserted and target_capability == "weak":
-            log.debug(
-                "_deliver_result_main_thread weak text target -> AX insert fallback"
+                log.debug("_deliver_result_main_thread used accessibility-first insertion")
+
+        if not inserted:
+            inserted = paste_at_cursor(
+                final,
+                prefer_applescript=False,
+                target_pid=self._target_app_pid,
             )
+            if inserted:
+                log.debug("_deliver_result_main_thread used keyboard paste fallback")
+
+        if not inserted and target_capability in {"strong", "weak"} and not tried_ax_insert:
             inserted = self._insert_text_via_accessibility(final)
             if inserted:
-                log.debug("_deliver_result_main_thread used weak text fallback")
-        elif not inserted:
-            log.debug("_deliver_result_main_thread no text target -> clipboard only")
+                log.debug("_deliver_result_main_thread used accessibility fallback after paste")
+
+        if not inserted:
+            inserted = insert_text_at_cursor(final, target_pid=self._target_app_pid)
+            if inserted:
+                log.debug("_deliver_result_main_thread used direct unicode typing fallback")
+            else:
+                log.debug("_deliver_result_main_thread no text target -> clipboard only")
 
         if inserted:
             if copy_text_to_clipboard(final):
@@ -2109,6 +2113,15 @@ class FreeWhisperApp(rumps.App):
         if session_id is not None:
             self._finish_session(session_id, "_finish_without_insertion_main_thread")
 
+    def _wait_for_gladia_retry(self, session_id, delay):
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            if not self._session_is_active(session_id) or self._cancel_requested:
+                log.debug(f"WORKER gladia retry wait aborted session={session_id}")
+                return False
+            time.sleep(min(0.1, max(0.0, deadline - time.time())))
+        return True
+
     # ── Background workers ──────────────────────────────────
 
     def _worker_record(self, session_id):
@@ -2141,78 +2154,120 @@ class FreeWhisperApp(rumps.App):
                 return
             time.sleep(0.01)
 
-        # 2) Init Gladia live session
-        try:
-            lang_cfg = {"languages": [cfg["language"]], "code_switching": cfg.get("code_switching", False)}
-            if cfg["language"] == "auto":
-                lang_cfg = {"languages": [], "code_switching": True}
+        lang_cfg = {
+            "languages": [cfg["language"]],
+            "code_switching": cfg.get("code_switching", False),
+        }
+        if cfg["language"] == "auto":
+            lang_cfg = {"languages": [], "code_switching": True}
 
-            resp = requests.post(
-                "https://api.gladia.io/v2/live",
-                headers={"Content-Type": "application/json", "x-gladia-key": cfg["api_key"]},
-                json={
-                    "encoding": "wav/pcm",
-                    "sample_rate": cfg["sample_rate"],
-                    "bit_depth": 16,
-                    "channels": 1,
-                    "model": cfg.get("model", "solaria-1"),
-                    "endpointing": 3,
-                    "maximum_duration_without_endpointing": 60,
-                    "language_config": lang_cfg,
-                    "pre_processing": {
-                        "audio_enhancer": True,
+        live_payload = {
+            "encoding": "wav/pcm",
+            "sample_rate": cfg["sample_rate"],
+            "bit_depth": 16,
+            "channels": 1,
+            "model": cfg.get("model", "solaria-1"),
+            "endpointing": 3,
+            "maximum_duration_without_endpointing": 60,
+            "language_config": lang_cfg,
+            "pre_processing": {
+                "audio_enhancer": True,
+            },
+            "realtime_processing": {
+                "named_entity_recognition": True,
+                "sentiment_analysis": True,
+            },
+            "messages_config": {"receive_partial_transcripts": False},
+        }
+
+        # 2/3) Init Gladia live session and connect WebSocket. Network hiccups
+        # must not end the user's recording; audio is already buffered locally
+        # and can be flushed once a live session is available.
+        ws = None
+        attempt = 0
+        retry_delay = _GLADIA_RETRY_INITIAL_SECONDS
+        while True:
+            if not self._session_is_active(session_id) or self._cancel_requested:
+                log.debug(f"WORKER cancelled before Gladia connect session={session_id}")
+                return
+
+            attempt += 1
+            try:
+                resp = requests.post(
+                    "https://api.gladia.io/v2/live",
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-gladia-key": cfg["api_key"],
                     },
-                    "realtime_processing": {
-                        "named_entity_recognition": True,
-                        "sentiment_analysis": True,
-                    },
-                    "messages_config": {"receive_partial_transcripts": False},
-                },
-                timeout=10,
-            )
-            if not resp.ok:
-                log.debug(f"WORKER gladia API {resp.status_code}: {resp.text}")
-            resp.raise_for_status()
-            ws_url = resp.json()["url"]
-            log.debug(f"WORKER gladia session OK url={ws_url[:60]}...")
+                    json=live_payload,
+                    timeout=10,
+                )
+                if not resp.ok:
+                    log.debug(
+                        "WORKER gladia API attempt=%s status=%s body=%s"
+                        % (attempt, resp.status_code, resp.text[:500])
+                    )
+                    if resp.status_code not in _GLADIA_TRANSIENT_HTTP_STATUSES:
+                        log.debug(
+                            "WORKER gladia API permanent failure -> cleanup session=%s"
+                            % session_id
+                        )
+                        self._cleanup(session_id)
+                        return
+                resp.raise_for_status()
+                ws_url = resp.json()["url"]
+                log.debug(
+                    "WORKER gladia session OK attempt=%s url=%s..."
+                    % (attempt, ws_url[:60])
+                )
+            except Exception as e:
+                log.debug(
+                    "WORKER gladia API attempt=%s FAILED: %s; retrying in %.1fs session=%s"
+                    % (attempt, e, retry_delay, session_id)
+                )
+                if not self._wait_for_gladia_retry(session_id, retry_delay):
+                    return
+                retry_delay = min(retry_delay * 1.6, _GLADIA_RETRY_MAX_SECONDS)
+                continue
+
             if not self._session_is_active(session_id) or self._cancel_requested:
                 log.debug(f"WORKER cancelled after Gladia session creation session={session_id}")
                 return
-        except Exception as e:
-            log.debug(f"WORKER gladia API FAILED: {e}")
-            self._cleanup(session_id)
-            return
 
-        # 3) Connect WebSocket
-        ws = None
-        try:
-            ws = ws_lib.WebSocket(
-                sslopt={"ca_certs": certifi.where(), "cert_reqs": ssl.CERT_REQUIRED}
-            )
-            ws.settimeout(30)
-            ws.connect(ws_url)
-            log.debug("WORKER websocket connected")
-            if not self._session_is_active(session_id) or self._cancel_requested:
-                log.debug(f"WORKER cancelled after websocket connect session={session_id}")
-                try:
-                    ws.send(json.dumps({"type": "stop_recording"}))
-                except Exception:
-                    pass
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-                return
-            self.ws = ws
-        except Exception as e:
-            log.debug(f"WORKER websocket FAILED: {e}")
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-            self._cleanup(session_id)
-            return
+            try:
+                ws = ws_lib.WebSocket(
+                    sslopt={"ca_certs": certifi.where(), "cert_reqs": ssl.CERT_REQUIRED}
+                )
+                ws.settimeout(30)
+                ws.connect(ws_url)
+                log.debug("WORKER websocket connected attempt=%s" % attempt)
+                if not self._session_is_active(session_id) or self._cancel_requested:
+                    log.debug(f"WORKER cancelled after websocket connect session={session_id}")
+                    try:
+                        ws.send(json.dumps({"type": "stop_recording"}))
+                    except Exception:
+                        pass
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
+                self.ws = ws
+                break
+            except Exception as e:
+                log.debug(
+                    "WORKER websocket attempt=%s FAILED: %s; retrying in %.1fs session=%s"
+                    % (attempt, e, retry_delay, session_id)
+                )
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    ws = None
+                if not self._wait_for_gladia_retry(session_id, retry_delay):
+                    return
+                retry_delay = min(retry_delay * 1.6, _GLADIA_RETRY_MAX_SECONDS)
 
         # 4) Start WS reader thread
         threading.Thread(target=self._ws_reader, args=(session_id, ws), daemon=True).start()
@@ -2374,7 +2429,7 @@ class FreeWhisperApp(rumps.App):
         if not self._session_can_deliver(session_id):
             log.debug(f"_paste_result skipped stale/cancelled session={session_id}")
             return
-        self._overlay.hide()
+        self._overlay.hide("paste_result")
         self._overlay.set_state("recording")
 
         if final:
@@ -2405,7 +2460,7 @@ class FreeWhisperApp(rumps.App):
             ws = self.ws
             self.audio_stream = None
             self.ws = None
-        self._overlay.hide()
+        self._overlay.hide("cleanup")
         if audio_stream:
             try:
                 audio_stream.stop()
