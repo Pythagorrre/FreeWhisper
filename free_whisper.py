@@ -158,15 +158,20 @@ _TEXT_INPUT_ROLES = {
     "AXTextArea",
     "AXTextField",
 }
-_BROWSER_APP_NAMES = {
+_KEYBOARD_PASTE_APP_NAMES = {
     "Arc",
     "Brave Browser",
+    "ChatGPT",
     "Codex",
     "Firefox",
+    "Ghostty",
     "Google Chrome",
     "Microsoft Edge",
     "Opera",
     "Safari",
+}
+_SESSION_PASTE_APP_NAMES = {
+    "Ghostty",
 }
 _PLACEHOLDER_STRING_ATTRS = (
     "AXPlaceholderValue",
@@ -1920,12 +1925,19 @@ class FreeWhisperApp(rumps.App):
 
     def _target_prefers_keyboard_paste(self):
         app_name = (self._target_app_name or "").strip()
-        prefers = app_name in _BROWSER_APP_NAMES
+        prefers = app_name in _KEYBOARD_PASTE_APP_NAMES
         if prefers:
             log.debug(
                 f"_target_prefers_keyboard_paste -> yes app={app_name} role={self._target_ax_role or '(unknown)'}"
             )
         return prefers
+
+    def _target_requires_session_paste(self):
+        app_name = (self._target_app_name or "").strip()
+        requires_session = app_name in _SESSION_PASTE_APP_NAMES
+        if requires_session:
+            log.debug(f"_target_requires_session_paste -> yes app={app_name}")
+        return requires_session
 
     def _insert_text_via_accessibility(self, text):
         element = self._target_ax_element
@@ -2052,6 +2064,9 @@ class FreeWhisperApp(rumps.App):
         copied_only = False
         target_capability = self._target_text_input_capability()
         prefers_keyboard_paste = self._target_prefers_keyboard_paste()
+        paste_target_pid = (
+            None if self._target_requires_session_paste() else self._target_app_pid
+        )
         tried_ax_insert = False
 
         if target_capability in {"strong", "weak"} and not prefers_keyboard_paste:
@@ -2064,7 +2079,7 @@ class FreeWhisperApp(rumps.App):
             inserted = paste_at_cursor(
                 final,
                 prefer_applescript=False,
-                target_pid=self._target_app_pid,
+                target_pid=paste_target_pid,
             )
             if inserted:
                 log.debug("_deliver_result_main_thread used keyboard paste fallback")
