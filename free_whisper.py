@@ -48,6 +48,8 @@ from app_runtime import (
     download_and_apply_update,
     launch_program_arguments,
     open_latest_release_page,
+    seconds_until_next_update_check,
+    UPDATE_CHECK_RETRY_SECONDS,
 )
 from overlay import OverlayWindow
 from settings_window import SettingsWindow
@@ -69,6 +71,8 @@ DEFAULT_CONFIG = {
     "show_notifications": True,
     "launch_at_startup": False,
     "show_menu_bar_icon": True,
+    "auto_update": True,
+    "last_update_check_at": 0,
 }
 
 # Modifier keys: (keyCode, device-independent flag mask)
@@ -721,6 +725,7 @@ class FreeWhisperApp(rumps.App):
         self._key_state_timer = None
         self._global_key_monitor = None
         self._settings_timer = None
+        self._update_check_timer = None
         self._hotkey_permission_prompted = False
         self._accessibility_permission_prompted = False
         self._audio_reset_lock = threading.Lock()
@@ -749,8 +754,8 @@ class FreeWhisperApp(rumps.App):
         self._start_listener()
         AppHelper.callAfter(self._apply_menu_bar_icon_visibility)
 
-        if self.cfg.get("auto_update", False):
-            threading.Thread(target=self._auto_update_on_launch, daemon=True).start()
+        if self.cfg.get("auto_update", True):
+            self._schedule_auto_update_check()
 
     # ── Hotkey listener (Quartz CGEvent tap) ────────────────
 
@@ -2509,22 +2514,50 @@ class FreeWhisperApp(rumps.App):
         )
         rumps.quit_application()
 
-    def _auto_update_on_launch(self):
-        """Background auto-update: check GitHub and install silently."""
+    def _save_config(self):
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(self.cfg, f, indent=2)
+
+    def _record_update_check(self):
+        self.cfg["last_update_check_at"] = time.time()
+        self._save_config()
+
+    def _schedule_auto_update_check(self, delay: float | None = None):
+        if not self.cfg.get("auto_update", True):
+            return
+        if delay is None:
+            delay = seconds_until_next_update_check(
+                self.cfg.get("last_update_check_at")
+            )
+        # Let the application finish launching before its first network call.
+        delay = max(5.0, delay)
+        timer = threading.Timer(delay, self._run_scheduled_update_check)
+        timer.daemon = True
+        self._update_check_timer = timer
+        timer.start()
+        log.debug("Next automatic update check scheduled in %.0f seconds", delay)
+
+    def _run_scheduled_update_check(self):
+        """Check GitHub daily and offer an update without installing silently."""
+        retry_delay = None
         try:
             result = check_for_update()
         except Exception:
-            log.exception("Auto-update check failed at launch")
-            return
-        if result is None:
-            log.debug("Auto-update: already up to date")
-            return
-        latest_version, dmg_url = result
-        log.debug("Auto-update: installing %s", latest_version)
-        try:
-            download_and_apply_update(dmg_url)
-        except Exception:
-            log.exception("Auto-update install failed")
+            log.exception("Scheduled update check failed")
+            retry_delay = UPDATE_CHECK_RETRY_SECONDS
+        else:
+            self._record_update_check()
+            if result is None:
+                log.debug("Scheduled update check: already up to date")
+            else:
+                latest_version, dmg_url, expected_sha256 = result
+                log.debug("Scheduled update available: %s", latest_version)
+                AppHelper.callAfter(
+                    lambda v=latest_version, u=dmg_url, d=expected_sha256:
+                    self._offer_update(v, u, d)
+                )
+        finally:
+            self._schedule_auto_update_check(delay=retry_delay)
 
     def _check_for_updates(self, _):
         log.debug("Menu requested update check")
@@ -2550,9 +2583,10 @@ class FreeWhisperApp(rumps.App):
                     )
                 )
             else:
-                latest_version, dmg_url = result
+                latest_version, dmg_url, expected_sha256 = result
                 AppHelper.callAfter(
-                    lambda v=latest_version, u=dmg_url: self._offer_update(v, u)
+                    lambda v=latest_version, u=dmg_url, d=expected_sha256:
+                    self._offer_update(v, u, d)
                 )
 
         threading.Thread(target=_do_check, daemon=True).start()
@@ -2576,7 +2610,12 @@ class FreeWhisperApp(rumps.App):
         alert.addButtonWithTitle_("OK")
         alert.runModal()
 
-    def _offer_update(self, version: str, dmg_url: str):
+    def _offer_update(
+        self,
+        version: str,
+        dmg_url: str,
+        expected_sha256: str,
+    ):
         alert = AppKit.NSAlert.alloc().init()
         icon = self._app_icon()
         if icon:
@@ -2596,7 +2635,7 @@ class FreeWhisperApp(rumps.App):
 
         def _do_update():
             try:
-                download_and_apply_update(dmg_url)
+                download_and_apply_update(dmg_url, expected_sha256)
             except Exception:
                 log.exception("Auto-update failed")
                 AppHelper.callAfter(

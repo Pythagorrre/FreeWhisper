@@ -766,7 +766,7 @@ class SettingsWindow:
         self._initial_launch_at_startup = cfg.get("launch_at_startup",
                                                    _is_launch_at_startup())
         self._initial_show_menu_bar_icon = cfg.get("show_menu_bar_icon", True)
-        self._initial_auto_update = cfg.get("auto_update", False)
+        self._initial_auto_update = cfg.get("auto_update", True)
 
         # Key visibility — start hidden
         self._gladia_key_value = self._initial_api_key
@@ -1097,9 +1097,10 @@ class SettingsWindow:
                     )
                 )
             else:
-                latest_version, dmg_url = result
+                latest_version, dmg_url, expected_sha256 = result
                 AppHelper.callAfter(
-                    lambda v=latest_version, u=dmg_url: self._offer_update(v, u)
+                    lambda v=latest_version, u=dmg_url, d=expected_sha256:
+                    self._offer_update(v, u, d)
                 )
 
         threading.Thread(target=_do_check, daemon=True).start()
@@ -1114,7 +1115,12 @@ class SettingsWindow:
         alert.addButtonWithTitle_("OK")
         alert.runModal()
 
-    def _offer_update(self, version: str, dmg_url: str):
+    def _offer_update(
+        self,
+        version: str,
+        dmg_url: str,
+        expected_sha256: str,
+    ):
         alert = AppKit.NSAlert.alloc().init()
         icon = _app_icon()
         if icon:
@@ -1134,7 +1140,7 @@ class SettingsWindow:
 
         def _do_update():
             try:
-                download_and_apply_update(dmg_url)
+                download_and_apply_update(dmg_url, expected_sha256)
             except Exception:
                 log.exception("Auto-update failed")
                 AppHelper.callAfter(

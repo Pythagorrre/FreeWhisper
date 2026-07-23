@@ -39,6 +39,7 @@ Pricing, limits, and free-tier details can change. Check the official provider p
 - First-class support for both Gladia and Cohere
 - Direct text insertion at the cursor, with clipboard fallback when needed
 - Native Settings window for hotkeys, language, provider selection, startup behavior, and menu bar visibility
+- Daily GitHub release checks with a confirmation prompt before installation
 - Optional launch at login
 - Standalone `.app` build for non-technical users
 
@@ -119,6 +120,17 @@ The standalone app stores its user data in standard macOS locations:
 - Logs: `~/Library/Logs/FreeWhisper/debug.log`
 
 That means the app bundle can live in `/Applications` like a normal Mac app, while your settings stay in your user account.
+
+## Updates
+
+FreeWhisper checks GitHub Releases at most once every 24 hours by default. When
+a newer version is available, the app asks before downloading or installing it.
+Automatic checks can be disabled in Settings, and a manual **Check for
+Updates…** command remains available from the menu bar.
+
+Downloaded updates are verified against the SHA-256 digest published by GitHub
+and checked with macOS code signing before the installed application is
+replaced.
 
 ## Build From Source
 

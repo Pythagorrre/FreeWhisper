@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import hmac
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from app_paths import APP_SOURCE_DIR, BUNDLE_ID, BUNDLE_PATH
 
@@ -94,6 +97,8 @@ def launch_program_arguments(force_new_instance: bool = False) -> list[str]:
 
 
 GITHUB_API_LATEST = "https://api.github.com/repos/Pythagorrre/FreeWhisper/releases/latest"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+UPDATE_CHECK_RETRY_SECONDS = 60 * 60
 
 # Fallback version when not running from an app bundle (dev mode).
 _FALLBACK_VERSION = "0.0.0"
@@ -126,11 +131,31 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def check_for_update() -> tuple[str, str] | None:
+def seconds_until_next_update_check(
+    last_checked_at: float | int | str | None,
+    *,
+    now: float | None = None,
+) -> float:
+    """Return the delay before the next scheduled GitHub update check."""
+    current_time = time.time() if now is None else now
+    try:
+        previous_time = float(last_checked_at or 0)
+    except (TypeError, ValueError):
+        previous_time = 0
+
+    if previous_time <= 0 or previous_time > current_time:
+        return 0
+    return max(
+        0,
+        UPDATE_CHECK_INTERVAL_SECONDS - (current_time - previous_time),
+    )
+
+
+def check_for_update() -> tuple[str, str, str] | None:
     """Check GitHub for a newer release.
 
-    Returns ``(latest_version, dmg_download_url)`` when an update is
-    available, or *None* if already up-to-date (or on error).
+    Returns ``(latest_version, dmg_download_url, expected_sha256)`` when an
+    update is available, or *None* if already up-to-date.
     """
     import requests  # imported lazily to keep startup fast
 
@@ -157,20 +182,32 @@ def check_for_update() -> tuple[str, str] | None:
 
     # Find the .dmg asset
     dmg_url: str | None = None
+    expected_sha256: str | None = None
     for asset in data.get("assets", []):
         name: str = asset.get("name", "")
         if name.lower().endswith(".dmg"):
             dmg_url = asset.get("browser_download_url")
+            digest = asset.get("digest", "")
+            if isinstance(digest, str) and digest.startswith("sha256:"):
+                expected_sha256 = digest.removeprefix("sha256:").lower()
             break
 
     if not dmg_url:
         raise RuntimeError(f"Release {latest_tag} has no .dmg asset")
+    if not expected_sha256 or len(expected_sha256) != 64:
+        raise RuntimeError(
+            f"Release {latest_tag} has no valid SHA-256 digest for its DMG"
+        )
 
     log.debug("Update available: %s -> %s  (%s)", current, latest_tag, dmg_url)
-    return latest_tag, dmg_url
+    return latest_tag, dmg_url, expected_sha256
 
 
-def download_and_apply_update(dmg_url: str, relaunch: bool = True) -> None:
+def download_and_apply_update(
+    dmg_url: str,
+    expected_sha256: str,
+    relaunch: bool = True,
+) -> None:
     """Download the DMG, replace the running app bundle, and relaunch.
 
     Must be called from a background thread — this function blocks while
@@ -190,11 +227,20 @@ def download_and_apply_update(dmg_url: str, relaunch: bool = True) -> None:
     try:
         # 1. Download DMG
         log.debug("Downloading update from %s", dmg_url)
+        digest = hashlib.sha256()
         with requests.get(dmg_url, stream=True, timeout=120) as r:
             r.raise_for_status()
             with open(dmg_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 16):
+                    digest.update(chunk)
                     f.write(chunk)
+
+        actual_sha256 = digest.hexdigest()
+        if not hmac.compare_digest(actual_sha256, expected_sha256.lower()):
+            raise RuntimeError(
+                "Downloaded update failed SHA-256 verification "
+                f"(expected {expected_sha256}, got {actual_sha256})"
+            )
 
         # 2. Mount DMG
         log.debug("Mounting DMG")
@@ -220,6 +266,15 @@ def download_and_apply_update(dmg_url: str, relaunch: bool = True) -> None:
                 break
         if not new_app:
             raise RuntimeError("No .app found in mounted DMG")
+        if _bundle_identifier(new_app) != FREEWHISPER_BUNDLE_ID:
+            raise RuntimeError(
+                f"Downloaded app has an unexpected bundle identifier"
+            )
+        subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", new_app],
+            check=True,
+            capture_output=True,
+        )
 
         # 4. Stage the new bundle next to the old one
         dest_parent = os.path.dirname(bundle)
