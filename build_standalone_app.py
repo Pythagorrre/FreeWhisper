@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "FreeWhisper"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 BUNDLE_ID = "com.freewhisper.app"
 BUNDLE_PATH = ROOT / f"{APP_NAME}.app"
 DESIGNATED_REQUIREMENT = f'designated => identifier "{BUNDLE_ID}"'
@@ -68,6 +68,16 @@ def codesign(
         cmd.append(f"-r={requirements}")
     cmd.append(str(path))
     run(cmd)
+
+
+def clear_signing_detritus(bundle_path: Path) -> None:
+    """Remove Finder metadata that macOS code signing rejects."""
+    for attribute in ("com.apple.FinderInfo", "com.apple.ResourceFork"):
+        subprocess.run(
+            ["xattr", "-dr", attribute, str(bundle_path)],
+            check=False,
+            capture_output=True,
+        )
 
 
 def copy_file(src: Path, dst: Path) -> None:
@@ -379,6 +389,7 @@ def build_bundle() -> Path:
         copy_python_runtime(bundle_path)
         copy_app_sources(bundle_path)
 
+        clear_signing_detritus(bundle_path)
         sign_runtime(bundle_path)
 
         if BUNDLE_PATH.exists():
